@@ -1,0 +1,25 @@
+name = "purplestar-api"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Workers 路由到自定义子域 api.purplestar.techhouse.ccwu.cc
+# （在 Cloudflare Dashboard 配置 Routes 或者用 Custom Domain）
+
+[vars]
+SITE_URL = "https://purplestar.techhouse.ccwu.cc"
+ALLOWED_ORIGIN = "https://purplestar.techhouse.ccwu.cc"
+
+# D1 数据库绑定
+[[d1_databases]]
+binding = "DB"
+database_name = "purplestar-db"
+database_id = "REPLACE_WITH_REAL_ID"  # wrangler d1 create 后填入
+
+# 密钥通过 wrangler secret put 设置（不入版本控制）
+# ANTHROPIC_API_KEY
+# STRIPE_SECRET_KEY
+# STRIPE_WEBHOOK_SECRET
+
+[observability]
+enabled = true

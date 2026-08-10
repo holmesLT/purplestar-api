@@ -1,0 +1,22 @@
+{
+  "name": "purplestar-api",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "db:init": "wrangler d1 execute purplestar-db --file=./schema.sql",
+    "db:remote": "wrangler d1 execute purplestar-db --remote --file=./schema.sql"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.27.0",
+    "hono": "^4.6.0",
+    "stripe": "^17.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250101.0",
+    "typescript": "^5",
+    "wrangler": "^3.99.0"
+  }
+}
