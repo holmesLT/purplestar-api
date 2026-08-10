@@ -14,7 +14,7 @@ ALLOWED_ORIGIN = "https://purplestar.techhouse.ccwu.cc"
 [[d1_databases]]
 binding = "DB"
 database_name = "purplestar-db"
-database_id = "REPLACE_WITH_REAL_ID"  # wrangler d1 create 后填入
+database_id = "e01d5909-3e31-4e21-b2d0-2862331b5909"  # wrangler d1 create 后填入
 
 # 密钥通过 wrangler secret put 设置（不入版本控制）
 # ANTHROPIC_API_KEY
