@@ -186,11 +186,14 @@ app.post('/api/interpret', async (c) => {
     return c.json({ error: 'Too many requests.' }, 429);
   }
 
-  const { chart, tier, sessionId } = await c.req.json() as {
-    chart: any; tier: 'basic' | 'premium'; sessionId: string;
+  const { chartId, chart: clientChart, tier, sessionId } = await c.req.json() as {
+    chartId?: string;
+    chart?: any;
+    tier: 'basic' | 'premium';
+    sessionId: string;
   };
 
-  if (!sessionId || !chart) return c.json({ error: 'Missing fields.' }, 400);
+  if (!sessionId) return c.json({ error: 'Missing sessionId.' }, 400);
 
   // 验证订单已支付
   const order = await c.env.DB.prepare(
@@ -203,6 +206,20 @@ app.post('/api/interpret', async (c) => {
 
   if (order.tier !== tier) {
     return c.json({ error: `Order is for tier ${order.tier}, not ${tier}.` }, 403);
+  }
+
+  // 优先用前端传的 chart，否则从 D1 拉（Payment Link 流程下前端没 hash）
+  let chart = clientChart;
+  if (!chart) {
+    const lookupId = chartId || order.chart_id;
+    if (!lookupId) return c.json({ error: 'Missing chart. Provide chartId or chart.' }, 400);
+
+    const row = await c.env.DB.prepare(
+      `SELECT chart_json FROM charts WHERE id = ? AND (expires_at IS NULL OR expires_at > ?)`
+    ).bind(lookupId, Math.floor(Date.now() / 1000)).first<{ chart_json: string }>();
+
+    if (!row) return c.json({ error: 'Chart not found in DB.' }, 404);
+    chart = JSON.parse(row.chart_json);
   }
 
   // 缓存命中
