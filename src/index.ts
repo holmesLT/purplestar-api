@@ -102,7 +102,12 @@ async function checkRate(c: any, ip: string, limit: number): Promise<boolean> {
 }
 
 // ====================================================================
-// Stripe Checkout
+// Stripe Payment Link (sandbox-friendly: Checkout Session API blocked on new accounts)
+// ====================================================================
+// 策略：用 paymentLinks.create 创建链接，after_completion 用 redirect 到 success_url
+// Payment Link 支付完成后 Stripe 会创建一个对应的 Checkout Session，sessionId 在
+// `checkout.session.completed` webhook 里能拿到 — 我们用 plink_<uuid> 占位 id，
+// webhook 到达时把 order id 更新成真实 cs_test_xxx，/api/interpret 按 sessionId 查就行。
 // ====================================================================
 
 app.post('/api/checkout', async (c) => {
@@ -120,32 +125,40 @@ app.post('/api/checkout', async (c) => {
   if (!chart) return c.json({ error: 'Chart not found. Please regenerate.' }, 404);
 
   const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
-  const session = await stripe.checkout.sessions.create({
-    mode: 'payment',
-    payment_method_types: ['card'],
-    line_items: [{
-      price_data: {
-        currency: 'usd',
-        product_data: {
-          name: tier === 'premium' ? 'PurpleStar Premium Full Report' : 'PurpleStar AI Reading',
-          description: tier === 'premium'
-            ? 'Comprehensive 3,000-5,000 word Ziwei Doushu reading covering 13 life themes.'
-            : 'Concise 500-800 word Ziwei Doushu reading covering 5 essential themes.',
-        },
-        unit_amount: prices[tier],
+
+  const lineItem = {
+    price_data: {
+      currency: 'usd',
+      product_data: {
+        name: tier === 'premium' ? 'PurpleStar Premium Full Report' : 'PurpleStar AI Reading',
+        description: tier === 'premium'
+          ? 'Comprehensive 3,000-5,000 word Ziwei Doushu reading covering 13 life themes.'
+          : 'Concise 500-800 word Ziwei Doushu reading covering 5 essential themes.',
       },
-      quantity: 1,
-    }],
-    metadata: { chartId, tier },
-    success_url: `${c.env.SITE_URL}/report/?chartId=${chartId}&tier=${tier}&session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${c.env.SITE_URL}/`,
+      unit_amount: prices[tier],
+    },
+    quantity: 1,
+  } as const;
+
+  const successUrl = `${c.env.SITE_URL}/report/?chartId=${chartId}&tier=${tier}&session_id={CHECKOUT_SESSION_ID}`;
+
+  const paymentLink = await stripe.paymentLinks.create({
+    line_items: [lineItem],
+    metadata: { chartId, tier, _placeholder: '1' },
+    after_completion: {
+      type: 'redirect',
+      redirect: { url: successUrl },
+    },
+    allow_promotion_codes: false,
   });
 
+  // Placeholder id — webhook 会更新成真实 cs_test_xxx
+  const placeholderId = `plink_${crypto.randomUUID()}`;
   await c.env.DB.prepare(
     `INSERT OR REPLACE INTO orders (id, chart_id, tier, amount, status) VALUES (?, ?, ?, ?, 'pending')`
-  ).bind(session.id, chartId, tier, prices[tier]).run();
+  ).bind(placeholderId, chartId, tier, prices[tier]).run();
 
-  return c.json({ url: session.url, sessionId: session.id });
+  return c.json({ url: paymentLink.url, sessionId: placeholderId });
 });
 
 // ====================================================================
@@ -251,10 +264,36 @@ app.post('/api/webhook/stripe', async (c) => {
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object as Stripe.Checkout.Session;
-    await c.env.DB.prepare(
+    const realSessionId = session.id;
+    const customerEmail = session.customer_details?.email || null;
+    const metadata = session.metadata || {};
+    const chartId = metadata.chartId as string | undefined;
+
+    // 1. 直接按真实 sessionId 更新（如果有的话）
+    const direct = await c.env.DB.prepare(
       `UPDATE orders SET status = 'paid', paid_at = unixepoch(), customer_email = ? WHERE id = ?`
-    ).bind(session.customer_details?.email || null, session.id).run();
-    console.log(`Payment received: ${session.id}`);
+    ).bind(customerEmail, realSessionId).run();
+    console.log(`[webhook] direct update on ${realSessionId}: meta=${direct.metaChanges}`);
+
+    // 2. 如果是通过 Payment Link 进入的，按 chartId 找到 placeholder order 并替换 id
+    if (chartId) {
+      const placeholder = await c.env.DB.prepare(
+        `SELECT id FROM orders WHERE chart_id = ? AND status = 'pending' AND id LIKE 'plink_%' LIMIT 1`
+      ).bind(chartId).first<{ id: string }>();
+
+      if (placeholder) {
+        // 把 placeholder 行的 id 改成真实 sessionId，并标记 paid
+        await c.env.DB.prepare(
+          `DELETE FROM orders WHERE id = ?`
+        ).bind(placeholder.id).run();
+        await c.env.DB.prepare(
+          `INSERT INTO orders (id, chart_id, tier, amount, status, paid_at, customer_email) VALUES (?, ?, ?, ?, 'paid', unixepoch(), ?)`
+        ).bind(realSessionId, chartId, metadata.tier || 'basic', session.amount_total || 999, customerEmail).run();
+        console.log(`[webhook] replaced placeholder ${placeholder.id} -> ${realSessionId} for chart ${chartId}`);
+      } else {
+        console.log(`[webhook] no placeholder found for chart ${chartId}`);
+      }
+    }
   }
 
   return c.json({ received: true });
