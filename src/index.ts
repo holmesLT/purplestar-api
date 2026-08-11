@@ -304,6 +304,8 @@ app.post('/api/webhook/stripe', async (c) => {
   const body = await c.req.text();
 
   console.log(`[webhook] hit, has sig: ${!!sig}, body length: ${body.length}`);
+  console.log(`[webhook] secret present: ${!!c.env.STRIPE_WEBHOOK_SECRET}, length: ${c.env.STRIPE_WEBHOOK_SECRET?.length}, prefix: ${c.env.STRIPE_WEBHOOK_SECRET?.substring(0, 12)}`);
+  console.log(`[webhook] sig header: ${sig?.substring(0, 30)}...`);
 
   if (!sig) return c.json({ error: 'No signature' }, 400);
 
