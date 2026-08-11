@@ -124,7 +124,7 @@ app.post('/api/checkout', async (c) => {
   const chart = await c.env.DB.prepare(`SELECT id FROM charts WHERE id = ?`).bind(chartId).first();
   if (!chart) return c.json({ error: 'Chart not found. Please regenerate.' }, 404);
 
-  const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
+  const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { apiVersion: '2025-09-30.clover' });
 
   const lineItem = {
     price_data: {
@@ -299,7 +299,7 @@ app.post('/api/webhook/debug', async (c) => {
 });
 
 app.post('/api/webhook/stripe', async (c) => {
-  const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
+  const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { apiVersion: '2025-09-30.clover' });
   const sig = c.req.header('stripe-signature');
   const body = await c.req.text();
 
