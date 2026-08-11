@@ -309,7 +309,7 @@ app.post('/api/webhook/stripe', async (c) => {
 
   let event: Stripe.Event;
   try {
-    event = stripe.webhooks.constructEvent(body, sig, c.env.STRIPE_WEBHOOK_SECRET);
+    event = await stripe.webhooks.constructEventAsync(body, sig, c.env.STRIPE_WEBHOOK_SECRET);
   } catch (err: any) {
     console.log(`[webhook] signature verify failed: ${err.message}`);
     return c.json({ error: err.message }, 400);
