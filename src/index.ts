@@ -265,6 +265,39 @@ app.post('/api/interpret', async (c) => {
 // Stripe Webhook
 // ====================================================================
 
+app.post('/api/webhook/debug', async (c) => {
+  // DEBUG ONLY: 接受任意 JSON，模拟 webhook 事件
+  const body = await c.req.json() as { type: string; data: { object: any } };
+  console.log(`[webhook-debug] type: ${body.type}`);
+  if (body.type === 'checkout.session.completed') {
+    const session = body.data.object;
+    const realSessionId = session.id;
+    const customerEmail = session.customer_details?.email || null;
+    const metadata = session.metadata || {};
+    const chartId = metadata.chartId as string | undefined;
+
+    const direct = await c.env.DB.prepare(
+      `UPDATE orders SET status = 'paid', paid_at = unixepoch(), customer_email = ? WHERE id = ?`
+    ).bind(customerEmail, realSessionId).run();
+    console.log(`[webhook-debug] direct update: ${JSON.stringify(direct)}`);
+
+    if (chartId) {
+      const placeholder = await c.env.DB.prepare(
+        `SELECT id FROM orders WHERE chart_id = ? AND status = 'pending' AND id LIKE 'plink_%' LIMIT 1`
+      ).bind(chartId).first<{ id: string }>();
+      if (placeholder) {
+        await c.env.DB.prepare(`DELETE FROM orders WHERE id = ?`).bind(placeholder.id).run();
+        await c.env.DB.prepare(
+          `INSERT INTO orders (id, chart_id, tier, amount, status, paid_at, customer_email) VALUES (?, ?, ?, ?, 'paid', unixepoch(), ?)`
+        ).bind(realSessionId, chartId, metadata.tier || 'basic', session.amount_total || 999, customerEmail).run();
+        console.log(`[webhook-debug] replaced ${placeholder.id} -> ${realSessionId}`);
+      }
+    }
+    return c.json({ debug: true, realSessionId, placeholderFound: !!chartId });
+  }
+  return c.json({ debug: true, type: body.type, handled: false });
+});
+
 app.post('/api/webhook/stripe', async (c) => {
   const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
   const sig = c.req.header('stripe-signature');
