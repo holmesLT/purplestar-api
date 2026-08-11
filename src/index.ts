@@ -3,16 +3,16 @@
  *
  * 架构：
  *   - 排盘：客户端用 iztro 库直接生成（无服务端计算）
- *   - 缓存：客户端把 chart 传到 /api/chart/save 存到 D1（仅用于付费时给后端用）
- *   - AI 解读：客户端发 chart + sessionId → Worker 调 Claude
- *   - 支付：Worker 创建 Stripe Checkout Session
+ *   - 缓存：客户端把 chart 传到 /api/chart/save 存到 D1（付费时给后端读 chart 用）
+ *   - 支付：Stripe Payment Link（固定 URL，硬编码在前端），webhook 只负责记录
+ *   - AI 解读：客户端发 chartId + sessionId → Worker 用 Stripe API 校验 session
+ *     已支付，再读 D1 里的 chart，调 Claude 生成解读
  *
  * 路由：
- *   POST /api/chart/save    暂存 chart 到 D1（client 提供数据）
- *   GET  /api/chart/:id     查询暂存的 chart
- *   POST /api/checkout      创建 Stripe Checkout
- *   POST /api/interpret     生成 AI 解读（验证订单）
- *   POST /api/webhook/stripe  Stripe 支付回调
+ *   POST /api/chart/save     暂存 chart 到 D1
+ *   GET  /api/chart/:id      查询暂存的 chart
+ *   POST /api/interpret      生成 AI 解读（Stripe API 校验订单已支付）
+ *   POST /api/webhook/stripe Stripe 支付回调（记录日志，写 payments 表留痕）
  *   GET  /health
  */
 
@@ -53,7 +53,7 @@ app.use('*', cors({
 app.get('/health', (c) => c.json({ status: 'ok', service: 'purplestar-api', timestamp: Date.now() }));
 
 // ====================================================================
-// 图表暂存（用于付费场景：Stripe webhook 后能找到 chart）
+// 图表暂存（用于付费场景：Stripe 校验通过后能从 D1 读到 chart）
 // ====================================================================
 
 app.post('/api/chart/save', async (c) => {
@@ -102,67 +102,7 @@ async function checkRate(c: any, ip: string, limit: number): Promise<boolean> {
 }
 
 // ====================================================================
-// Stripe Payment Link (sandbox-friendly: Checkout Session API blocked on new accounts)
-// ====================================================================
-// 策略：用 paymentLinks.create 创建链接，after_completion 用 redirect 到 success_url
-// Payment Link 支付完成后 Stripe 会创建一个对应的 Checkout Session，sessionId 在
-// `checkout.session.completed` webhook 里能拿到 — 我们用 plink_<uuid> 占位 id，
-// webhook 到达时把 order id 更新成真实 cs_test_xxx，/api/interpret 按 sessionId 查就行。
-// ====================================================================
-
-app.post('/api/checkout', async (c) => {
-  const ip = c.req.header('cf-connecting-ip') || 'unknown';
-  if (!await checkRate(c, ip, 10)) {
-    return c.json({ error: 'Too many requests.' }, 429);
-  }
-
-  const { chartId, tier } = await c.req.json() as { chartId: string; tier: 'basic' | 'premium' };
-
-  const prices: Record<string, number> = { basic: 999, premium: 2999 };
-  if (!prices[tier]) return c.json({ error: 'Invalid tier.' }, 400);
-
-  const chart = await c.env.DB.prepare(`SELECT id FROM charts WHERE id = ?`).bind(chartId).first();
-  if (!chart) return c.json({ error: 'Chart not found. Please regenerate.' }, 404);
-
-  const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { apiVersion: '2025-09-30.clover' });
-
-  const lineItem = {
-    price_data: {
-      currency: 'usd',
-      product_data: {
-        name: tier === 'premium' ? 'PurpleStar Premium Full Report' : 'PurpleStar AI Reading',
-        description: tier === 'premium'
-          ? 'Comprehensive 3,000-5,000 word Ziwei Doushu reading covering 13 life themes.'
-          : 'Concise 500-800 word Ziwei Doushu reading covering 5 essential themes.',
-      },
-      unit_amount: prices[tier],
-    },
-    quantity: 1,
-  } as const;
-
-  const successUrl = `${c.env.SITE_URL}/report/?chartId=${chartId}&tier=${tier}&session_id={CHECKOUT_SESSION_ID}`;
-
-  const paymentLink = await stripe.paymentLinks.create({
-    line_items: [lineItem],
-    metadata: { chartId, tier, _placeholder: '1' },
-    after_completion: {
-      type: 'redirect',
-      redirect: { url: successUrl },
-    },
-    allow_promotion_codes: false,
-  });
-
-  // Placeholder id — webhook 会更新成真实 cs_test_xxx
-  const placeholderId = `plink_${crypto.randomUUID()}`;
-  await c.env.DB.prepare(
-    `INSERT OR REPLACE INTO orders (id, chart_id, tier, amount, status) VALUES (?, ?, ?, ?, 'pending')`
-  ).bind(placeholderId, chartId, tier, prices[tier]).run();
-
-  return c.json({ url: paymentLink.url, sessionId: placeholderId });
-});
-
-// ====================================================================
-// AI 解读
+// AI 解读 — Stripe API 实时校验 session 已支付
 // ====================================================================
 
 const SYSTEM_PROMPT = `You are an expert Ziwei Doushu (Purple Star Astrology) astrologer trained on the Ni Haixia Tianji lineage — the most authoritative contemporary interpretation system.
@@ -194,30 +134,36 @@ app.post('/api/interpret', async (c) => {
   };
 
   if (!sessionId) return c.json({ error: 'Missing sessionId.' }, 400);
-
-  // 验证订单已支付
-  const order = await c.env.DB.prepare(
-    `SELECT status, tier, chart_id FROM orders WHERE id = ?`
-  ).bind(sessionId).first<{ status: string; tier: string; chart_id: string }>();
-
-  if (!order || order.status !== 'paid') {
-    return c.json({ error: 'Payment not verified.', status: order?.status }, 403);
+  if (!sessionId.startsWith('cs_')) {
+    return c.json({ error: 'Invalid sessionId format.' }, 400);
   }
 
-  if (order.tier !== tier) {
-    return c.json({ error: `Order is for tier ${order.tier}, not ${tier}.` }, 403);
+  // 用 Stripe API 实时校验 session 已支付
+  const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { apiVersion: '2025-09-30.clover' });
+  let session: Stripe.Checkout.Session;
+  try {
+    session = await stripe.checkout.sessions.retrieve(sessionId);
+  } catch (err: any) {
+    return c.json({ error: `Stripe lookup failed: ${err.message}` }, 400);
   }
 
-  // 优先用前端传的 chart，否则从 D1 拉（Payment Link 流程下前端没 hash）
+  if (session.payment_status !== 'paid') {
+    return c.json({ error: 'Payment not verified.', status: session.payment_status }, 403);
+  }
+
+  // 校验 tier 金额匹配（防止用户用 basic session 拿 premium 报告）
+  const expectedAmount = tier === 'premium' ? 2999 : 999;
+  if (session.amount_total !== expectedAmount) {
+    return c.json({ error: `Session amount ${session.amount_total} does not match tier ${tier} (${expectedAmount}).` }, 403);
+  }
+
+  // 优先用前端传的 chart，否则从 D1 拉
   let chart = clientChart;
   if (!chart) {
-    const lookupId = chartId || order.chart_id;
-    if (!lookupId) return c.json({ error: 'Missing chart. Provide chartId or chart.' }, 400);
-
+    if (!chartId) return c.json({ error: 'Missing chart. Provide chartId or chart.' }, 400);
     const row = await c.env.DB.prepare(
       `SELECT chart_json FROM charts WHERE id = ? AND (expires_at IS NULL OR expires_at > ?)`
-    ).bind(lookupId, Math.floor(Date.now() / 1000)).first<{ chart_json: string }>();
-
+    ).bind(chartId, Math.floor(Date.now() / 1000)).first<{ chart_json: string }>();
     if (!row) return c.json({ error: 'Chart not found in DB.' }, 404);
     chart = JSON.parse(row.chart_json);
   }
@@ -235,8 +181,28 @@ app.post('/api/interpret', async (c) => {
   const context = chartToPromptContext(chart);
 
   const userPrompt = tier === 'premium'
-    ? `Generate a COMPREHENSIVE Ziwei Doushu reading (3,000-5,000 words) for:\n\n${context}\n\nCover 13 themes in order:\n1. Life Overview\n2. Personality & Temperament\n3. Career & Wealth Path\n4. Relationships & Marriage\n5. Family & Social Bonds\n6. Health & Vitality\n7. Travel & External Relations\n8. Mental State & Spirituality\n9. Major Luck Periods (next 10-year cycles)\n10. Annual Fortune ${new Date().getFullYear()}\n11. Auspicious Patterns\n12. Challenges & Remedies\n13. Practical Wisdom`
-    : `Generate a CONCISE Ziwei Doushu reading (500-800 words) for:\n\n${context}\n\nCover 5 themes:\n1. Cosmic Identity\n2. Career & Money\n3. Relationships\n4. Life Cycles\n5. One Key Insight\n\nEnd with brief encouragement.`;
+    ? `Generate a COMPREHENSIVE Ziwei Doushu reading (3,000-5,000 words) for:\n\n${context}\n\nCover 13 themes in order:
+1. Life Overview
+2. Personality & Temperament
+3. Career & Wealth Path
+4. Relationships & Marriage
+5. Family & Social Bonds
+6. Health & Vitality
+7. Travel & External Relations
+8. Mental State & Spirituality
+9. Major Luck Periods (next 10-year cycles)
+10. Annual Fortune ${new Date().getFullYear()}
+11. Auspicious Patterns
+12. Challenges & Remedies
+13. Practical Wisdom`
+    : `Generate a CONCISE Ziwei Doushu reading (500-800 words) for:\n\n${context}\n\nCover 5 themes:
+1. Cosmic Identity
+2. Career & Money
+3. Relationships
+4. Life Cycles
+5. One Key Insight
+
+End with brief encouragement.`;
 
   const message = await anthropic.messages.create({
     model: 'claude-sonnet-4-5',
@@ -251,7 +217,7 @@ app.post('/api/interpret', async (c) => {
     `INSERT INTO readings (id, chart_id, order_id, tier, content, tokens_used) VALUES (?, ?, ?, ?, ?, ?)`
   ).bind(
     crypto.randomUUID(),
-    order.chart_id,
+    chartId || 'unknown',
     sessionId,
     tier,
     text,
@@ -262,46 +228,8 @@ app.post('/api/interpret', async (c) => {
 });
 
 // ====================================================================
-// Stripe Webhook
+// Stripe Webhook — 自实现 HMAC 验签 + 留痕
 // ====================================================================
-
-app.post('/api/webhook/debug', async (c) => {
-  // DEBUG ONLY: 接受任意 JSON，模拟 webhook 事件
-  // 用 STRIPE_SECRET_KEY 作为 token 防止滥用
-  const auth = c.req.header('authorization');
-  if (auth !== `Bearer ${c.env.STRIPE_SECRET_KEY}`) {
-    return c.json({ error: 'unauthorized' }, 401);
-  }
-  const body = await c.req.json() as { type: string; data: { object: any } };
-  console.log(`[webhook-debug] type: ${body.type}`);
-  if (body.type === 'checkout.session.completed') {
-    const session = body.data.object;
-    const realSessionId = session.id;
-    const customerEmail = session.customer_details?.email || null;
-    const metadata = session.metadata || {};
-    const chartId = metadata.chartId as string | undefined;
-
-    const direct = await c.env.DB.prepare(
-      `UPDATE orders SET status = 'paid', paid_at = unixepoch(), customer_email = ? WHERE id = ?`
-    ).bind(customerEmail, realSessionId).run();
-    console.log(`[webhook-debug] direct update: ${JSON.stringify(direct)}`);
-
-    if (chartId) {
-      const placeholder = await c.env.DB.prepare(
-        `SELECT id FROM orders WHERE chart_id = ? AND status = 'pending' AND id LIKE 'plink_%' LIMIT 1`
-      ).bind(chartId).first<{ id: string }>();
-      if (placeholder) {
-        await c.env.DB.prepare(`DELETE FROM orders WHERE id = ?`).bind(placeholder.id).run();
-        await c.env.DB.prepare(
-          `INSERT INTO orders (id, chart_id, tier, amount, status, paid_at, customer_email) VALUES (?, ?, ?, ?, 'paid', unixepoch(), ?)`
-        ).bind(realSessionId, chartId, metadata.tier || 'basic', session.amount_total || 999, customerEmail).run();
-        console.log(`[webhook-debug] replaced ${placeholder.id} -> ${realSessionId}`);
-      }
-    }
-    return c.json({ debug: true, realSessionId, placeholderFound: !!chartId });
-  }
-  return c.json({ debug: true, type: body.type, handled: false });
-});
 
 app.post('/api/webhook/stripe', async (c) => {
   const sig = c.req.header('stripe-signature');
@@ -315,19 +243,14 @@ app.post('/api/webhook/stripe', async (c) => {
     const [k, v] = p.split('=');
     acc[k] = v;
     return acc;
-  }, {});
+  }, {} as Record<string, string>);
   const timestamp = parts.t;
   const v1 = parts.v1;
+  if (!timestamp || !v1) return c.json({ error: 'Invalid signature header' }, 400);
 
-  if (!timestamp || !v1) {
-    return c.json({ error: 'Invalid signature header' }, 400);
-  }
-
-  // Reject signatures older than 5 minutes (replay protection)
+  // 防重放
   const age = Math.abs(Date.now() / 1000 - Number(timestamp));
-  if (age > 300) {
-    return c.json({ error: 'Timestamp too old' }, 400);
-  }
+  if (age > 300) return c.json({ error: 'Timestamp too old' }, 400);
 
   const signedPayload = `${timestamp}.${body}`;
   const key = await crypto.subtle.importKey(
@@ -337,60 +260,38 @@ app.post('/api/webhook/stripe', async (c) => {
     false,
     ['verify']
   );
+  const sigBytes = hexToBytes(v1);
   const expectedSig = await crypto.subtle.verify(
     'HMAC',
     key,
-    hexToBytes(v1),
-    new TextEncoder().encode(signedPayload)
+    sigBytes as BufferSource,
+    new TextEncoder().encode(signedPayload) as BufferSource
   );
+  if (!expectedSig) return c.json({ error: 'Invalid signature' }, 400);
 
-  if (!expectedSig) {
-    return c.json({ error: 'Invalid signature' }, 400);
-  }
-
-  const event = JSON.parse(body) as Stripe.Event;
+  const event = JSON.parse(body);
   console.log(`[webhook] verified: type=${event.type}, id=${event.id}`);
 
   if (event.type === 'checkout.session.completed') {
-    const session = event.data.object as Stripe.Checkout.Session;
-    const realSessionId = session.id;
-    const customerEmail = session.customer_details?.email || null;
-    const metadata = session.metadata || {};
-    const chartId = metadata.chartId as string | undefined;
-
-    // 1. 直接按真实 sessionId 更新（如果有的话）
-    const direct = await c.env.DB.prepare(
-      `UPDATE orders SET status = 'paid', paid_at = unixepoch(), customer_email = ? WHERE id = ?`
-    ).bind(customerEmail, realSessionId).run();
-    console.log(`[webhook] direct update on ${realSessionId}: meta=${direct.metaChanges}`);
-
-    // 2. 如果是通过 Payment Link 进入的，按 chartId 找到 placeholder order 并替换 id
-    if (chartId) {
-      const placeholder = await c.env.DB.prepare(
-        `SELECT id FROM orders WHERE chart_id = ? AND status = 'pending' AND id LIKE 'plink_%' LIMIT 1`
-      ).bind(chartId).first<{ id: string }>();
-
-      if (placeholder) {
-        // 把 placeholder 行的 id 改成真实 sessionId，并标记 paid
-        await c.env.DB.prepare(
-          `DELETE FROM orders WHERE id = ?`
-        ).bind(placeholder.id).run();
-        await c.env.DB.prepare(
-          `INSERT INTO orders (id, chart_id, tier, amount, status, paid_at, customer_email) VALUES (?, ?, ?, ?, 'paid', unixepoch(), ?)`
-        ).bind(realSessionId, chartId, metadata.tier || 'basic', session.amount_total || 999, customerEmail).run();
-        console.log(`[webhook] replaced placeholder ${placeholder.id} -> ${realSessionId} for chart ${chartId}`);
-      } else {
-        console.log(`[webhook] no placeholder found for chart ${chartId}`);
-      }
+    const session = event.data.object;
+    // 留痕：写入 payments 表便于对账
+    try {
+      await c.env.DB.prepare(
+        `INSERT OR IGNORE INTO payments (session_id, amount_total, currency, customer_email, status, paid_at)
+         VALUES (?, ?, ?, ?, 'paid', unixepoch())`
+      ).bind(
+        session.id,
+        session.amount_total ?? 0,
+        session.currency ?? 'usd',
+        session.customer_details?.email ?? null
+      ).run();
+    } catch (err: any) {
+      console.log(`[webhook] payments insert skipped: ${err.message}`);
     }
   }
 
   return c.json({ received: true });
 });
-
-// ====================================================================
-// Helpers
-// ====================================================================
 
 function hexToBytes(hex: string): Uint8Array {
   const bytes = new Uint8Array(hex.length / 2);
@@ -399,6 +300,10 @@ function hexToBytes(hex: string): Uint8Array {
   }
   return bytes;
 }
+
+// ====================================================================
+// Helpers
+// ====================================================================
 
 function chartToPromptContext(chart: any): string {
   const lines: string[] = [];
