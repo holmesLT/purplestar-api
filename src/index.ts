@@ -267,6 +267,11 @@ app.post('/api/interpret', async (c) => {
 
 app.post('/api/webhook/debug', async (c) => {
   // DEBUG ONLY: 接受任意 JSON，模拟 webhook 事件
+  // 用 STRIPE_SECRET_KEY 作为 token 防止滥用
+  const auth = c.req.header('authorization');
+  if (auth !== `Bearer ${c.env.STRIPE_SECRET_KEY}`) {
+    return c.json({ error: 'unauthorized' }, 401);
+  }
   const body = await c.req.json() as { type: string; data: { object: any } };
   console.log(`[webhook-debug] type: ${body.type}`);
   if (body.type === 'checkout.session.completed') {
@@ -299,24 +304,52 @@ app.post('/api/webhook/debug', async (c) => {
 });
 
 app.post('/api/webhook/stripe', async (c) => {
-  const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { apiVersion: '2025-09-30.clover' });
   const sig = c.req.header('stripe-signature');
   const body = await c.req.text();
 
-  console.log(`[webhook] hit, has sig: ${!!sig}, body length: ${body.length}`);
-  console.log(`[webhook] secret present: ${!!c.env.STRIPE_WEBHOOK_SECRET}, length: ${c.env.STRIPE_WEBHOOK_SECRET?.length}, prefix: ${c.env.STRIPE_WEBHOOK_SECRET?.substring(0, 12)}`);
-  console.log(`[webhook] sig header: ${sig?.substring(0, 30)}...`);
-
   if (!sig) return c.json({ error: 'No signature' }, 400);
 
-  let event: Stripe.Event;
-  try {
-    event = await stripe.webhooks.constructEventAsync(body, sig, c.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err: any) {
-    console.log(`[webhook] signature verify failed: ${err.message}`);
-    return c.json({ error: err.message }, 400);
+  // 自实现 Stripe webhook 签名验证（避免 Stripe SDK 18+ 在 Workers 上的 SubtleCryptoProvider 同步问题）
+  // 格式: t=<timestamp>,v1=<hmac_sha256(timestamp.body, secret)>
+  const parts = sig.split(',').reduce((acc: any, p) => {
+    const [k, v] = p.split('=');
+    acc[k] = v;
+    return acc;
+  }, {});
+  const timestamp = parts.t;
+  const v1 = parts.v1;
+
+  if (!timestamp || !v1) {
+    return c.json({ error: 'Invalid signature header' }, 400);
   }
-  console.log(`[webhook] event type: ${event.type}, id: ${event.id}`);
+
+  // Reject signatures older than 5 minutes (replay protection)
+  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (age > 300) {
+    return c.json({ error: 'Timestamp too old' }, 400);
+  }
+
+  const signedPayload = `${timestamp}.${body}`;
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(c.env.STRIPE_WEBHOOK_SECRET),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['verify']
+  );
+  const expectedSig = await crypto.subtle.verify(
+    'HMAC',
+    key,
+    hexToBytes(v1),
+    new TextEncoder().encode(signedPayload)
+  );
+
+  if (!expectedSig) {
+    return c.json({ error: 'Invalid signature' }, 400);
+  }
+
+  const event = JSON.parse(body) as Stripe.Event;
+  console.log(`[webhook] verified: type=${event.type}, id=${event.id}`);
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object as Stripe.Checkout.Session;
@@ -358,6 +391,14 @@ app.post('/api/webhook/stripe', async (c) => {
 // ====================================================================
 // Helpers
 // ====================================================================
+
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+  }
+  return bytes;
+}
 
 function chartToPromptContext(chart: any): string {
   const lines: string[] = [];
