@@ -270,14 +270,18 @@ app.post('/api/webhook/stripe', async (c) => {
   const sig = c.req.header('stripe-signature');
   const body = await c.req.text();
 
+  console.log(`[webhook] hit, has sig: ${!!sig}, body length: ${body.length}`);
+
   if (!sig) return c.json({ error: 'No signature' }, 400);
 
   let event: Stripe.Event;
   try {
     event = stripe.webhooks.constructEvent(body, sig, c.env.STRIPE_WEBHOOK_SECRET);
   } catch (err: any) {
+    console.log(`[webhook] signature verify failed: ${err.message}`);
     return c.json({ error: err.message }, 400);
   }
+  console.log(`[webhook] event type: ${event.type}, id: ${event.id}`);
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object as Stripe.Checkout.Session;
