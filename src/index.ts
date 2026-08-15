@@ -37,16 +37,23 @@ export interface Env {
 
 const app = new Hono<{ Bindings: Env }>();
 
-// CORS
+// CORS — 同时允许新老域名(过渡期 techhouse.ccwu.cc 还可能在老用户访问)
+// 永久接受 primary domain(purplestar.cc)和老域名(techhouse.ccwu.cc)
 app.use('*', cors({
   origin: (origin, c) => {
-    const allowed = c.env.ALLOWED_ORIGIN;
-    if (origin === allowed) return origin;
-    if (origin?.startsWith('http://localhost')) return origin;
-    return allowed;
+    // 允许的 origin 列表(写死比读 env 更安全)
+    const allowed = new Set([
+      c.env.ALLOWED_ORIGIN,                                  // 主域名
+      'https://purplestar.techhouse.ccwu.cc',                // 老域名(过渡)
+      'https://techhouse.ccwu.cc',                           // 老根域(意外)
+    ]);
+    if (origin && allowed.has(origin)) return origin;
+    if (origin?.startsWith('http://localhost')) return origin; // dev
+    // 不在白名单:echo 主域名(stripe / 监控脚本无 origin 时 fallback)
+    return c.env.ALLOWED_ORIGIN;
   },
   allowMethods: ['GET', 'POST', 'OPTIONS'],
-  allowHeaders: ['Content-Type'],
+  allowHeaders: ['Content-Type', 'Stripe-Signature'],
   maxAge: 86400,
 }));
 
@@ -86,9 +93,9 @@ app.get('/api/chart/:id', async (c) => {
 async function checkRate(c: any, ip: string, limit: number): Promise<boolean> {
   const now = Math.floor(Date.now() / 1000);
   const key = `rl:${ip}:${Math.floor(now / 60)}`;
-  const counter = await c.env.DB.prepare(
+  const counter: any = await c.env.DB.prepare(
     `SELECT count FROM rate_limits WHERE key = ?`
-  ).bind(key).first<{ count: number }>();
+  ).bind(key).first();
 
   const count = counter?.count ?? 0;
   if (count >= limit) return false;
@@ -139,8 +146,10 @@ app.post('/api/interpret', async (c) => {
   }
 
   // 用 Stripe API 实时校验 session 已支付
-  const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { apiVersion: '2025-09-30.clover' });
-  let session: Stripe.Checkout.Session;
+  // apiVersion 必须是 SDK 支持的版本(SDK 17 → '2025-02-24.acacia')。
+  // 老代码写 '2025-09-30.clover' 已不在 SDK 17 白名单。
+  const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { apiVersion: '2025-02-24.acacia' });
+  let session: any; // Stripe SDK 17 移除了 Checkout.Session generic,用 any 兼容
   try {
     session = await stripe.checkout.sessions.retrieve(sessionId);
   } catch (err: any) {

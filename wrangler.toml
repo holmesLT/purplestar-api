@@ -3,12 +3,13 @@ main = "src/index.ts"
 compatibility_date = "2026-01-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Workers 路由到自定义子域 api.purplestar.techhouse.ccwu.cc
-# （在 Cloudflare Dashboard 配置 Routes 或者用 Custom Domain）
+# Workers 路由 — Custom Domain 绑到 api.purplestar.cc
+# 在 Cloudflare Dashboard 配置：Workers & Pages → purplestar-api → Settings → Triggers → Custom Domains → 添加 api.purplestar.cc
 
 [vars]
-SITE_URL = "https://purplestar.techhouse.ccwu.cc"
-ALLOWED_ORIGIN = "https://purplestar.techhouse.ccwu.cc"
+SITE_URL = "https://purplestar.cc"
+# 同时允许新老域名过渡期调用(老域名还在 301 重定向)
+ALLOWED_ORIGIN = "https://purplestar.cc"
 
 # D1 数据库绑定
 [[d1_databases]]
