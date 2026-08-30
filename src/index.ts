@@ -61,6 +61,36 @@ app.use('*', cors({
 app.get('/health', (c) => c.json({ status: 'ok', service: 'purplestar-api', timestamp: Date.now() }));
 
 // ====================================================================
+// Admin endpoints — guarded by ADMIN_KEY secret (set via wrangler secret put ADMIN_KEY)
+//   POST /api/admin/reset-hd-counters
+//     - DELETE all crypto_payments test orders
+//     - DELETE crypto_hd_wallet_per_currency rows
+//     - INSERT fresh rows for 'xrp' and 'usdt_trc20' at next_index = 0
+//     - Use after replacing XRP_MNEMONIC to start fresh address space
+// ====================================================================
+async function requireAdmin(c: any): Promise<boolean> {
+  const auth = c.req.header('X-Admin-Key') || c.req.header('Authorization')?.replace(/^Bearer\s+/i, '');
+  return !!auth && auth === (c.env as any).ADMIN_KEY;
+}
+
+app.post('/api/admin/reset-hd-counters', async (c) => {
+  if (!(await requireAdmin(c))) return c.json({ error: 'unauthorized' }, 401);
+  try {
+    await ensureCryptoSchema(c.env);
+    const now = Math.floor(Date.now() / 1000);
+    const before = await c.env.DB.prepare(`SELECT COUNT(*) as n FROM crypto_payments`).first<{ n: number }>();
+    await c.env.DB.prepare(`DELETE FROM crypto_payments`).run();
+    await c.env.DB.prepare(`DELETE FROM crypto_hd_wallet_per_currency`).run();
+    await c.env.DB.prepare(
+      `INSERT INTO crypto_hd_wallet_per_currency (pay_currency, next_index, updated_at) VALUES ('xrp', 0, ?), ('usdt_trc20', 0, ?)`
+    ).bind(now, now).run();
+    return c.json({ ok: true, deleted_payments: before?.n ?? 0, reset_at: now });
+  } catch (err: any) {
+    return c.json({ ok: false, error: err.message }, 500);
+  }
+});
+
+// ====================================================================
 // Stripe REST helper — 替代 Stripe SDK
 //   用 fetch 直接调 https://api.stripe.com/v1/...
 // ====================================================================
@@ -575,11 +605,28 @@ async function getFxRate(
 }
 
 // atomic next_index — 按币种各自递增(XRP / Tron / 未来 BTC 用不同派生路径)
-// 单一 index 改为每币种一行
+// 第一次见到一个新币种时,从旧的全局 crypto_hd_wallet 拿当前 max(避免与历史 XRP 订单撞 address)
 async function allocateNextDerivationIndex(env: Env, payCurrency: string): Promise<number> {
-  await env.DB.prepare(
-    `INSERT OR IGNORE INTO crypto_hd_wallet_per_currency (pay_currency, next_index, updated_at) VALUES (?, 0, unixepoch())`
-  ).bind(payCurrency).run();
+  // 先看这个币种是不是已经有自己的 counter
+  const existing = await env.DB.prepare(
+    `SELECT next_index FROM crypto_hd_wallet_per_currency WHERE pay_currency = ?`
+  ).bind(payCurrency).first<{ next_index: number }>();
+  if (!existing) {
+    // 第一次用这个币种 — 检查旧的全局 counter(只对 XRP 适用),从那里继续
+    let startIdx = 0;
+    if (payCurrency === 'xrp') {
+      const oldRow = await env.DB.prepare(
+        `SELECT next_index FROM crypto_hd_wallet WHERE id = 1`
+      ).first<{ next_index: number }>();
+      startIdx = oldRow?.next_index ?? 0;
+    }
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO crypto_hd_wallet_per_currency (pay_currency, next_index, updated_at) VALUES (?, ?, unixepoch())`
+    ).bind(payCurrency, startIdx).run();
+    if (startIdx > 0) {
+      console.log(`[hd-index] migrated ${payCurrency} start_idx=${startIdx} from legacy crypto_hd_wallet`);
+    }
+  }
   const row = await env.DB.prepare(
     `SELECT next_index FROM crypto_hd_wallet_per_currency WHERE pay_currency = ?`
   ).bind(payCurrency).first<{ next_index: number }>();
@@ -695,10 +742,10 @@ app.post('/api/crypto/create-payment', async (c) => {
     }
 
     const now = Math.floor(Date.now() / 1000);
-    // 通用 INSERT — amount_xrp 在 usdt 订单里填 0,xrp_usd_rate 在 usdt 里填 usdt_usd_rate
+    // 通用 INSERT — amount_xrp / xrp_usd_rate 原始 schema 是 NOT NULL,usdt 订单必须填 0 才能过约束
     const amountXrpForRow = payCurrency === 'xrp' ? payAmount : 0;
     const amountUsdtForRow = payCurrency === 'usdt_trc20' ? payAmount : null;
-    const xrpRateForRow = payCurrency === 'xrp' ? fxRate : null;
+    const xrpRateForRow = payCurrency === 'xrp' ? fxRate : 0;  // NOT NULL column
     const usdtRateForRow = payCurrency === 'usdt_trc20' ? fxRate : null;
     await c.env.DB.prepare(
       `INSERT INTO crypto_payments
