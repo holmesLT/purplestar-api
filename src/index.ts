@@ -526,6 +526,7 @@ app.post('/indexnow', async (c) => {
 // ====================================================================
 
 import { deriveXrpAddressFromMnemonic } from './lib/xrp-hd';
+import { deriveTronAddressFromMnemonic } from './lib/tron-hd';
 
 const SELF_TIER_AMOUNTS: Record<string, { usd: number; product: string; expires_sec: number }> = {
   basic: { usd: 12.9, product: 'PurpleStar Basic Reading', expires_sec: 1800 },   // 30 min
@@ -534,44 +535,58 @@ const SELF_TIER_AMOUNTS: Record<string, { usd: number; product: string; expires_
 
 // 简单的 USD/XRP 汇率缓存(D1 存最近一次查询结果,5 分钟过期)
 async function getXrpUsdRate(env: Env): Promise<number> {
+  return getFxRate(env, 'xrp', 'XRP_USD_PRICE_URL', 'ripple', 1.4);
+}
+
+async function getUsdtUsdRate(env: Env): Promise<number> {
+  // USDT 通常 ≈ $1,但保险起见查一下。CoinGecko id = 'tether'
+  return getFxRate(env, 'usdt', 'USDT_USD_PRICE_URL', 'tether', 1.0);
+}
+
+// 通用 FX rate 缓存(cache key by coin)
+async function getFxRate(
+  env: Env,
+  coin: string,
+  envVarKey: string,
+  coingeckoId: string,
+  fallback: number,
+): Promise<number> {
   const cached = await env.DB.prepare(
-    `SELECT rate, fetched_at FROM crypto_fx_cache WHERE id = 1`
-  ).first<{ rate: number; fetched_at: number }>();
+    `SELECT rate, fetched_at FROM crypto_fx_cache WHERE id = ?`
+  ).bind(coin === 'xrp' ? 1 : (coin === 'usdt' ? 2 : 3)).first<{ rate: number; fetched_at: number }>();
   const now = Math.floor(Date.now() / 1000);
-  if (cached && (now - cached.fetched_at) < 300) {
-    return cached.rate;
-  }
+  if (cached && (now - cached.fetched_at) < 300) return cached.rate;
+  const url = (env as any)[envVarKey] || `https://api.coingecko.com/api/v3/simple/price?ids=${coingeckoId}&vs_currencies=usd`;
   try {
-    const r = await fetch(env.XRP_USD_PRICE_URL || 'https://api.coingecko.com/api/v3/simple/price?ids=ripple&vs_currencies=usd');
+    const r = await fetch(url);
     if (!r.ok) throw new Error(`FX rate fetch failed: ${r.status}`);
     const j: any = await r.json();
-    const rate = j?.ripple?.usd;
+    const rate = j?.[coingeckoId]?.usd;
     if (typeof rate !== 'number') throw new Error('rate missing in FX response');
     await env.DB.prepare(
-      `INSERT OR REPLACE INTO crypto_fx_cache (id, rate, fetched_at) VALUES (1, ?, ?)`
-    ).bind(rate, now).run();
+      `INSERT OR REPLACE INTO crypto_fx_cache (id, rate, fetched_at) VALUES (?, ?, ?)`
+    ).bind(coin === 'xrp' ? 1 : (coin === 'usdt' ? 2 : 3), rate, now).run();
     return rate;
   } catch (e) {
-    // FX 查询失败 — 用最近一次缓存或 1.4 (XRP 长期大概 $0.5-$3)
     if (cached) return cached.rate;
-    console.error('[crypto] FX rate fallback:', e);
-    return 1.4;
+    console.error(`[crypto ${coin}] FX rate fallback:`, e);
+    return fallback;
   }
 }
 
-// atomic next_index — 用单行 UPDATE 自增
-async function allocateNextDerivationIndex(env: Env): Promise<number> {
+// atomic next_index — 按币种各自递增(XRP / Tron / 未来 BTC 用不同派生路径)
+// 单一 index 改为每币种一行
+async function allocateNextDerivationIndex(env: Env, payCurrency: string): Promise<number> {
   await env.DB.prepare(
-    `INSERT OR IGNORE INTO crypto_hd_wallet (id, next_index, updated_at) VALUES (1, 0, unixepoch())`
-  ).run();
-  // 单实例 atomic 用 UPSERT;多实例可能冲突(但 CF Worker 单一地域单实例,实际安全)
+    `INSERT OR IGNORE INTO crypto_hd_wallet_per_currency (pay_currency, next_index, updated_at) VALUES (?, 0, unixepoch())`
+  ).bind(payCurrency).run();
   const row = await env.DB.prepare(
-    `SELECT next_index FROM crypto_hd_wallet WHERE id = 1`
-  ).first<{ next_index: number }>();
+    `SELECT next_index FROM crypto_hd_wallet_per_currency WHERE pay_currency = ?`
+  ).bind(payCurrency).first<{ next_index: number }>();
   const idx = row?.next_index ?? 0;
   await env.DB.prepare(
-    `UPDATE crypto_hd_wallet SET next_index = next_index + 1, updated_at = unixepoch() WHERE id = 1`
-  ).run();
+    `UPDATE crypto_hd_wallet_per_currency SET next_index = next_index + 1, updated_at = unixepoch() WHERE pay_currency = ?`
+  ).bind(payCurrency).run();
   return idx;
 }
 
@@ -607,6 +622,19 @@ async function ensureCryptoSchema(env: Env): Promise<void> {
         rate REAL NOT NULL,
         fetched_at INTEGER NOT NULL
       )`,
+      // multi-currency 扩展 (USDT TRC20 等):每加一个币种,加一个派生索引字段 + 金额字段
+      `CREATE TABLE IF NOT EXISTS crypto_hd_wallet_per_currency (
+        pay_currency TEXT PRIMARY KEY,
+        next_index INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+      )`,
+      // ALTER TABLE IF NOT EXISTS — SQLite 不支持,改成 try/catch 每列
+      `ALTER TABLE crypto_payments ADD COLUMN pay_currency TEXT NOT NULL DEFAULT 'xrp'`,
+      `ALTER TABLE crypto_payments ADD COLUMN amount_usdt REAL`,
+      `ALTER TABLE crypto_payments ADD COLUMN usdt_usd_rate REAL`,
+      `ALTER TABLE crypto_payments ADD COLUMN amount_btc REAL`,
+      `ALTER TABLE crypto_payments ADD COLUMN btc_usd_rate REAL`,
+      `CREATE INDEX IF NOT EXISTS idx_crypto_payments_currency ON crypto_payments(pay_currency)`,
     ];
     for (const sql of stmts) {
       try { await env.DB.prepare(sql).run(); } catch (e: any) { /* ignore */ }
@@ -620,12 +648,18 @@ app.post('/api/crypto/create-payment', async (c) => {
     // 幂等建表(D1 token 没 schema 权限时,worker 启动时自己 IF NOT EXISTS)
     await ensureCryptoSchema(c.env);
 
-    const body = await c.req.json().catch(() => null) as { tier?: string; chartId?: string; chart?: any } | null;
+    const body = await c.req.json().catch(() => null) as {
+      tier?: string; chartId?: string; chart?: any; pay_currency?: string;
+    } | null;
     if (!body) return c.json({ error: 'invalid JSON body' }, 400);
 
     const tier = body.tier;
     if (tier !== 'basic' && tier !== 'premium') {
       return c.json({ error: 'tier must be basic or premium' }, 400);
+    }
+    const payCurrency = (body.pay_currency || 'xrp').toLowerCase();
+    if (!['xrp', 'usdt_trc20'].includes(payCurrency)) {
+      return c.json({ error: `pay_currency must be one of: xrp, usdt_trc20 (got: ${payCurrency})` }, 400);
     }
     const { usd, expires_sec } = SELF_TIER_AMOUNTS[tier];
 
@@ -637,29 +671,53 @@ app.post('/api/crypto/create-payment', async (c) => {
       ).bind(body.chartId, '{}', JSON.stringify(body.chart), now + 86400).run();
     }
 
-    // 派生新地址
+    // 派生新地址(每币种独立 HD index)
     const orderId = crypto.randomUUID();
-    const derivationIndex = await allocateNextDerivationIndex(c.env);
-    const derived = deriveXrpAddressFromMnemonic(c.env.XRP_MNEMONIC, derivationIndex);
+    const derivationIndex = await allocateNextDerivationIndex(c.env, payCurrency);
+    let address: string;
+    let payAmount: number;
+    let fxRate: number;
 
-    // 锁定 XRP 金额(USD 价 × 1.05 buffer 给汇率波动;30 分钟内有效)
-    const xrpUsd = await getXrpUsdRate(c.env);
-    const xrpAmount = Math.ceil((usd / xrpUsd) * 1.05 * 1000000) / 1000000;  // 6 位精度,向上取整
+    if (payCurrency === 'xrp') {
+      const derived = deriveXrpAddressFromMnemonic(c.env.XRP_MNEMONIC, derivationIndex);
+      address = derived.address;
+      const xrpUsd = await getXrpUsdRate(c.env);
+      fxRate = xrpUsd;
+      payAmount = Math.ceil((usd / xrpUsd) * 1.05 * 1_000_000) / 1_000_000; // 6 位精度,向上取整
+    } else {
+      // usdt_trc20 — Tron HD wallet
+      const derived = deriveTronAddressFromMnemonic(c.env.XRP_MNEMONIC, derivationIndex);
+      address = derived.address;
+      const usdtUsd = await getUsdtUsdRate(c.env);
+      fxRate = usdtUsd;
+      // USDT TRC20 6 decimals,与 XRP 一致精度
+      payAmount = Math.ceil((usd / usdtUsd) * 1.05 * 1_000_000) / 1_000_000;
+    }
 
     const now = Math.floor(Date.now() / 1000);
+    // 通用 INSERT — amount_xrp 在 usdt 订单里填 0,xrp_usd_rate 在 usdt 里填 usdt_usd_rate
+    const amountXrpForRow = payCurrency === 'xrp' ? payAmount : 0;
+    const amountUsdtForRow = payCurrency === 'usdt_trc20' ? payAmount : null;
+    const xrpRateForRow = payCurrency === 'xrp' ? fxRate : null;
+    const usdtRateForRow = payCurrency === 'usdt_trc20' ? fxRate : null;
     await c.env.DB.prepare(
       `INSERT INTO crypto_payments
-         (order_id, address, derivation_index, tier, chart_id, amount_xrp, amount_usd, xrp_usd_rate, status, expires_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?)`
+         (order_id, address, derivation_index, pay_currency, tier, chart_id,
+          amount_xrp, amount_usd, xrp_usd_rate, amount_usdt, usdt_usd_rate,
+          status, expires_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?)`
     ).bind(
       orderId,
-      derived.address,
+      address,
       derivationIndex,
+      payCurrency,
       tier,
       body.chartId || null,
-      xrpAmount,
+      amountXrpForRow,
       usd,
-      xrpUsd,
+      xrpRateForRow,
+      amountUsdtForRow,
+      usdtRateForRow,
       now + expires_sec,
       now,
     ).run();
@@ -667,11 +725,11 @@ app.post('/api/crypto/create-payment', async (c) => {
     return c.json({
       ok: true,
       order_id: orderId,
-      pay_address: derived.address,
-      pay_amount: xrpAmount,
-      pay_currency: 'xrp',
+      pay_address: address,
+      pay_amount: payAmount,
+      pay_currency: payCurrency,
       amount_usd: usd,
-      xrp_usd_rate: xrpUsd,
+      fx_rate: fxRate,
       tier,
       expires_at: now + expires_sec,
       expires_in_sec: expires_sec,
@@ -681,16 +739,30 @@ app.post('/api/crypto/create-payment', async (c) => {
   }
 });
 
-// 状态查询
+// 状态查询(支持多币种 xrp | usdt_trc20)
 app.get('/api/crypto/payment/:orderId', async (c) => {
   const orderId = c.req.param('orderId');
+  await ensureCryptoSchema(c.env);
   const row = await c.env.DB.prepare(
-    `SELECT order_id, address, derivation_index, tier, chart_id, amount_xrp, amount_usd,
-            xrp_usd_rate, status, tx_hash, paid_at, expires_at, created_at, finished_at
+    `SELECT order_id, address, derivation_index, pay_currency, tier, chart_id,
+            amount_xrp, amount_usd, xrp_usd_rate,
+            amount_usdt, usdt_usd_rate,
+            status, tx_hash, paid_at, expires_at, created_at, finished_at
      FROM crypto_payments WHERE order_id = ?`
   ).bind(orderId).first<any>();
   if (!row) return c.json({ error: 'payment not found' }, 404);
-  return c.json(row);
+  const now = Math.floor(Date.now() / 1000);
+  const expired = now > row.expires_at && row.status === 'waiting';
+  const payCurrency = row.pay_currency || 'xrp';
+  const amountUnits = payCurrency === 'xrp' ? row.amount_xrp : row.amount_usdt;
+  const fxRate = payCurrency === 'xrp' ? row.xrp_usd_rate : row.usdt_usd_rate;
+  return c.json({
+    ...row,
+    status: expired ? 'expired' : row.status,
+    pay_currency: payCurrency,
+    pay_amount: amountUnits,
+    fx_rate: fxRate,
+  });
 });
 
 
@@ -898,11 +970,24 @@ async function fetchAccountTxs(address: string, limit = 20): Promise<RippleTrans
   return j?.result?.transactions || [];
 }
 
+/**
+ * Fetch incoming USDT TRC20 transactions for a Tron address via TronGrid.
+ * Public endpoint, no API key needed for low volume; rate limit is generous.
+ * Returns the `data` array (each item has token_info, to, value, transaction_id, block_timestamp, confirmations).
+ */
+async function fetchTronTrc20Txs(address: string, limit = 20): Promise<any[]> {
+  const url = `https://api.trongrid.io/v1/accounts/${address}/transactions/trc20?only_confirmed=true&limit=${limit}`;
+  const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+  if (!r.ok) throw new Error(`TronGrid ${r.status}`);
+  const j: any = await r.json();
+  return j?.data || [];
+}
+
 async function watchCryptoPayments(env: Env): Promise<{ scanned: number; confirmed: number; expired: number }> {
   const now = Math.floor(Date.now() / 1000);
-  // 取所有未完成且未过期的订单
+  // 取所有未完成且未过期的订单,包含 pay_currency 和 amount 字段
   const pending = await env.DB.prepare(
-    `SELECT order_id, address, amount_xrp, status, expires_at, created_at, tier
+    `SELECT order_id, address, pay_currency, amount_xrp, amount_usdt, status, expires_at, created_at, tier
      FROM crypto_payments
      WHERE status IN ('waiting', 'confirming') AND expires_at > ?
      ORDER BY created_at ASC
@@ -912,27 +997,60 @@ async function watchCryptoPayments(env: Env): Promise<{ scanned: number; confirm
   let confirmed = 0;
   for (const p of pending.results || []) {
     try {
-      const txs = await fetchAccountTxs(p.address, 20);
-      for (const t of txs) {
-        // 仅 Payment 类型 + 成功
-        if (t.tx?.Destination !== p.address) continue;
-        if (t.meta?.TransactionResult && t.meta.TransactionResult !== 'tesSUCCESS') continue;
-        const amt = t.tx.Amount;
-        // XRP Amount 单位是 drops (1 XRP = 1,000,000 drops)
-        const drops = typeof amt === 'string' ? amt : null;
-        if (!drops) continue;
-        const xrpReceived = Number(drops) / 1_000_000;
-        // 容忍 ±5% 汇率波动
-        if (xrpReceived >= p.amount_xrp * 0.95) {
-          const txHash = t.tx.hash;
-          await env.DB.prepare(
-            `UPDATE crypto_payments
-             SET status = 'finished', tx_hash = ?, paid_at = ?, finished_at = ?
-             WHERE order_id = ? AND status IN ('waiting', 'confirming')`
-          ).bind(txHash, now, now, p.order_id).run();
-          confirmed++;
-          console.log(`[watcher] finished order=${p.order_id} addr=${p.address} tx=${txHash} received=${xrpReceived} XRP`);
-          break;
+      const payCurrency = p.pay_currency || 'xrp';
+      if (payCurrency === 'xrp') {
+        // XRP — XRPL account_tx
+        const txs = await fetchAccountTxs(p.address, 20);
+        for (const t of txs) {
+          if (t.tx?.Destination !== p.address) continue;
+          if (t.meta?.TransactionResult && t.meta.TransactionResult !== 'tesSUCCESS') continue;
+          const amt = t.tx.Amount;
+          const drops = typeof amt === 'string' ? amt : null;
+          if (!drops) continue;
+          const xrpReceived = Number(drops) / 1_000_000;
+          if (xrpReceived >= p.amount_xrp * 0.95) {
+            const txHash = t.tx.hash;
+            await env.DB.prepare(
+              `UPDATE crypto_payments
+               SET status = 'finished', tx_hash = ?, paid_at = ?, finished_at = ?
+               WHERE order_id = ? AND status IN ('waiting', 'confirming')`
+            ).bind(txHash, now, now, p.order_id).run();
+            confirmed++;
+            console.log(`[watcher/xrp] finished order=${p.order_id} addr=${p.address} tx=${txHash} received=${xrpReceived} XRP`);
+            break;
+          }
+        }
+      } else if (payCurrency === 'usdt_trc20') {
+        // USDT TRC20 — TronGrid /v1/accounts/{addr}/transactions/trc20
+        const trc20Txs = await fetchTronTrc20Txs(p.address, 20);
+        const USDT_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
+        for (const tx of trc20Txs) {
+          if (tx.token_info?.address !== USDT_CONTRACT) continue;
+          if (tx.to !== p.address) continue;
+          // confirmed status — block too deep = unconfirmed
+          // trongrid returns confirmations from block height; treat confirmed=true if present
+          if (tx.confirmations !== undefined && tx.confirmations < 1) continue;
+          // amount: USDT TRC20 6 decimals — string
+          const raw = tx.value || tx.amount_str;
+          if (!raw) continue;
+          // trongrid sometimes returns numeric amount (already divided by 10^6); sometimes raw 6-decimal string
+          let received: number;
+          if (typeof raw === 'number') {
+            received = raw;
+          } else {
+            received = Number(raw) / 1_000_000;
+          }
+          if (received >= p.amount_usdt * 0.95) {
+            const txHash = tx.transaction_id;
+            await env.DB.prepare(
+              `UPDATE crypto_payments
+               SET status = 'finished', tx_hash = ?, paid_at = ?, finished_at = ?
+               WHERE order_id = ? AND status IN ('waiting', 'confirming')`
+            ).bind(txHash, now, now, p.order_id).run();
+            confirmed++;
+            console.log(`[watcher/usdt] finished order=${p.order_id} addr=${p.address} tx=${txHash} received=${received} USDT`);
+            break;
+          }
         }
       }
     } catch (err: any) {

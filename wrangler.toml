@@ -16,6 +16,7 @@ SITE_URL = "https://purplestar.cc"
 # 同时允许新老域名过渡期调用(老域名还在 301 重定向)
 ALLOWED_ORIGIN = "https://purplestar.cc"
 XRP_USD_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ripple&vs_currencies=usd"
+USDT_USD_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=usd"
 
 # D1 数据库绑定
 [[d1_databases]]
