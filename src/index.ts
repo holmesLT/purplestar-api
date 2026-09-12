@@ -661,8 +661,8 @@ import { deriveXrpAddressFromMnemonic } from './lib/xrp-hd';
 import { deriveTronAddressFromMnemonic } from './lib/tron-hd';
 
 const SELF_TIER_AMOUNTS: Record<string, { usd: number; product: string; expires_sec: number }> = {
-  basic: { usd: 12.9, product: 'PurpleStar Basic Reading', expires_sec: 1800 },   // 30 min
-  premium: { usd: 19.9, product: 'PurpleStar Premium Reading', expires_sec: 1800 },
+  basic: { usd: 3.99, product: 'PurpleStar AI Reading', expires_sec: 1800 },   // 30 min — 与 Stripe 价格一致
+  premium: { usd: 9.99, product: 'PurpleStar Premium Full Report', expires_sec: 1800 },
 };
 
 // 简单的 USD/XRP 汇率缓存(D1 存最近一次查询结果,5 分钟过期)
