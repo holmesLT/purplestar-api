@@ -7,3 +7,4 @@ out/
 .DS_Store
 dist/
 build/
+.wrangler-test/

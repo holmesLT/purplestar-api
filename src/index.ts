@@ -42,6 +42,108 @@ export interface Env {
   SITE_URL: string;
   ALLOWED_ORIGIN: string;
   DB: D1Database;
+  // Cryptomus (方案 B 加密支付) — 通过 `wrangler secret put` 配置
+  CRYPTOMUS_MERCHANT_ID?: string;
+  CRYPTOMUS_PAYMENT_API_KEY?: string;
+}
+
+// ============================================================================
+// Cryptomus 支付网关
+//   - 建单:  POST https://api.cryptomus.com/v1/payment
+//   - 查单:  GET  https://api.cryptomus.com/v1/payment/{uuid}
+//   - 回调:  POST {API}/api/crypto/webhook/cryptomus  (sign = md5(b64(body)+key))
+//   验签:  sign = md5(base64(JSON body) + PAYMENT_API_KEY);GET 空 body 时
+//          base64('') === '' 故 sign = md5(API_KEY)
+// ============================================================================
+
+const CRYPTOMUS_API = 'https://api.cryptomus.com/v1';
+// 挂在你自己的 worker 域名下;改域名时同步修改
+const CRYPTOMUS_WEBHOOK_URL = 'https://api.purplestar.cc/api/crypto/webhook/cryptomus';
+// Cryptomus 发票有效期(秒)。文档默认/最小值较宽,取 1 小时。
+const CRYPTOMUS_LIFETIME_SEC = 3600;
+
+function md5(input: string): string {
+  const msg = new TextEncoder().encode(input);
+  const bitLen = msg.length * 8;
+  const padded = new Uint8Array((((msg.length + 8) >> 6) + 1) << 6);
+  padded.set(msg);
+  padded[msg.length] = 0x80;
+  const dv = new DataView(padded.buffer);
+  dv.setUint32(padded.length - 8, bitLen >>> 0, true);
+  dv.setUint32(padded.length - 4, Math.floor(bitLen / 0x100000000), true);
+
+  const S = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+             5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+             4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+             6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+  const K = new Uint32Array(64);
+  for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296);
+
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  for (let off = 0; off < padded.length; off += 64) {
+    const M = new Uint32Array(16);
+    for (let i = 0; i < 16; i++) M[i] = dv.getUint32(off + i * 4, true);
+    let A = a0, B = b0, C = c0, D = d0;
+    for (let i = 0; i < 64; i++) {
+      let F: number, g: number;
+      if (i < 16) { F = (B & C) | (~B & D); g = i; }
+      else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; }
+      else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) % 16; }
+      else { F = C ^ (B | ~D); g = (7 * i) % 16; }
+      F = (F + A + K[i] + M[g]) >>> 0;
+      A = D; D = C; C = B;
+      B = (B + ((F << S[i]) | (F >>> (32 - S[i])))) >>> 0;
+    }
+    a0 = (a0 + A) >>> 0; b0 = (b0 + B) >>> 0; c0 = (c0 + C) >>> 0; d0 = (d0 + D) >>> 0;
+  }
+  const out = new Uint32Array([a0, b0, c0, d0]);
+  return Array.from(new Uint8Array(out.buffer))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function cryptomusRequest(
+  env: Env,
+  method: 'GET' | 'POST',
+  path: string,
+  body?: Record<string, unknown>,
+): Promise<any> {
+  const apiKey = env.CRYPTOMUS_PAYMENT_API_KEY!;
+  const bodyJson = body ? JSON.stringify(body) : '';
+  const sign = md5(btoa(bodyJson) + apiKey);
+  const resp = await fetch(`${CRYPTOMUS_API}${path}`, {
+    method,
+    headers: {
+      merchant: env.CRYPTOMUS_MERCHANT_ID!,
+      sign,
+      'Content-Type': 'application/json',
+    },
+    body: method === 'POST' ? bodyJson : undefined,
+  });
+  const data: any = await resp.json().catch(() => null);
+  if (!resp.ok || !data || data.state !== 0) {
+    throw new Error(`Cryptomus ${path} failed (${resp.status}): ${JSON.stringify(data)}`);
+  }
+  return data.result;
+}
+
+// Cryptomus payment_status → 本库 crypto_payments.status
+// 成功态映射为 'confirmed'(/api/interpret 的解锁校验已接受该状态)
+function mapCryptomusStatus(ps: string): 'waiting' | 'confirmed' | 'failed' | 'expired' {
+  switch (ps) {
+    case 'confirmed':
+    case 'paid':          // 已打款、等待网络确认;TRC20 通常秒级进入 confirmed
+      return 'confirmed';
+    case 'canceled':
+    case 'fail':
+    case 'wrong_amount':
+      return 'failed';
+    case 'expired':
+    case 'not_paid':
+      return 'expired';
+    default:              // check / process / confirm_check / create / etc.
+      return 'waiting';
+  }
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -681,6 +783,10 @@ async function ensureCryptoSchema(env: Env): Promise<void> {
       `ALTER TABLE crypto_payments ADD COLUMN usdt_usd_rate REAL`,
       `ALTER TABLE crypto_payments ADD COLUMN amount_btc REAL`,
       `ALTER TABLE crypto_payments ADD COLUMN btc_usd_rate REAL`,
+      // Cryptomus(方案 B)扩展列
+      `ALTER TABLE crypto_payments ADD COLUMN processor TEXT NOT NULL DEFAULT 'self_hd'`,
+      `ALTER TABLE crypto_payments ADD COLUMN cryptomus_uuid TEXT`,
+      `ALTER TABLE crypto_payments ADD COLUMN invoice_url TEXT`,
       `CREATE INDEX IF NOT EXISTS idx_crypto_payments_currency ON crypto_payments(pay_currency)`,
     ];
     for (const sql of stmts) {
@@ -704,19 +810,73 @@ app.post('/api/crypto/create-payment', async (c) => {
     if (tier !== 'basic' && tier !== 'premium') {
       return c.json({ error: 'tier must be basic or premium' }, 400);
     }
+
+    // 暂存 chart(可选)
+    if (body.chart && body.chartId) {
+      const now0 = Math.floor(Date.now() / 1000);
+      await c.env.DB.prepare(
+        `INSERT OR REPLACE INTO charts (id, input_json, chart_json, expires_at) VALUES (?, ?, ?, ?)`
+      ).bind(body.chartId, '{}', JSON.stringify(body.chart), now0 + 86400).run();
+    }
+
+    // ===== Cryptomus 托管收银台(方案 B)=====
+    // 配置了密钥即启用:托管页支持 200+ 币种,用户自选币种/网络,
+    // 无需 HD 地址派生与链上对账,资金自动归集到 Cryptomus 钱包。
+    if (c.env.CRYPTOMUS_MERCHANT_ID && c.env.CRYPTOMUS_PAYMENT_API_KEY) {
+      const { usd, expires_sec } = SELF_TIER_AMOUNTS[tier];
+      const orderId = crypto.randomUUID();
+      const frontendBase = (c.env.SITE_URL || 'https://purplestar.cc').replace(/\/$/, '');
+      const invoice = await cryptomusRequest(c.env, 'POST', '/payment', {
+        amount: usd.toFixed(2),
+        currency: 'USD',
+        order_id: orderId,
+        url_callback: CRYPTOMUS_WEBHOOK_URL,
+        url_return: `${frontendBase}/payment-return-crypto/?order_id=${orderId}&tier=${tier}`,
+        url_success: `${frontendBase}/report/?chartId=${body.chartId || ''}&tier=${tier}&self_crypto_order_id=${orderId}`,
+        lifetime: Math.max(CRYPTOMUS_LIFETIME_SEC, expires_sec),
+      });
+
+      const now = Math.floor(Date.now() / 1000);
+      await c.env.DB.prepare(
+        `INSERT INTO crypto_payments
+           (order_id, address, derivation_index, pay_currency, tier, chart_id,
+            amount_xrp, amount_usd, xrp_usd_rate,
+            status, expires_at, created_at,
+            processor, cryptomus_uuid, invoice_url)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?, 'cryptomus', ?, ?)`
+      ).bind(
+        orderId,
+        invoice.url,        // address 列 UNIQUE NOT NULL — 托管模式下存发票 URL(每单唯一)
+        -1,                 // 非 HD 派生单
+        'cryptomus',
+        tier,
+        body.chartId || null,
+        0,
+        usd,
+        0,
+        now + expires_sec,
+        now,
+        invoice.uuid,
+        invoice.url,
+      ).run();
+
+      return c.json({
+        ok: true,
+        processor: 'cryptomus',
+        order_id: orderId,
+        invoice_url: invoice.url,
+        amount_usd: usd,
+        tier,
+        expires_at: now + expires_sec,
+      });
+    }
+
+    // ===== 自托管 HD 钱包路径(无 Cryptomus 密钥时的后备)=====
     const payCurrency = (body.pay_currency || 'xrp').toLowerCase();
     if (!['xrp', 'usdt_trc20'].includes(payCurrency)) {
       return c.json({ error: `pay_currency must be one of: xrp, usdt_trc20 (got: ${payCurrency})` }, 400);
     }
     const { usd, expires_sec } = SELF_TIER_AMOUNTS[tier];
-
-    // 暂存 chart(可选)
-    if (body.chart && body.chartId) {
-      const now = Math.floor(Date.now() / 1000);
-      await c.env.DB.prepare(
-        `INSERT OR REPLACE INTO charts (id, input_json, chart_json, expires_at) VALUES (?, ?, ?, ?)`
-      ).bind(body.chartId, '{}', JSON.stringify(body.chart), now + 86400).run();
-    }
 
     // 派生新地址(每币种独立 HD index)
     const orderId = crypto.randomUUID();
@@ -786,7 +946,7 @@ app.post('/api/crypto/create-payment', async (c) => {
   }
 });
 
-// 状态查询(支持多币种 xrp | usdt_trc20)
+// 状态查询(支持多币种 xrp | usdt_trc20 | cryptomus)
 app.get('/api/crypto/payment/:orderId', async (c) => {
   const orderId = c.req.param('orderId');
   await ensureCryptoSchema(c.env);
@@ -794,22 +954,95 @@ app.get('/api/crypto/payment/:orderId', async (c) => {
     `SELECT order_id, address, derivation_index, pay_currency, tier, chart_id,
             amount_xrp, amount_usd, xrp_usd_rate,
             amount_usdt, usdt_usd_rate,
-            status, tx_hash, paid_at, expires_at, created_at, finished_at
+            status, tx_hash, paid_at, expires_at, created_at, finished_at,
+            processor, cryptomus_uuid, invoice_url
      FROM crypto_payments WHERE order_id = ?`
   ).bind(orderId).first<any>();
   if (!row) return c.json({ error: 'payment not found' }, 404);
   const now = Math.floor(Date.now() / 1000);
   const expired = now > row.expires_at && row.status === 'waiting';
+
+  // Cryptomus 订单:waiting 状态下主动向网关实时查询(webhook 丢失的兜底)
+  if (
+    row.processor === 'cryptomus' && row.status === 'waiting' && !expired &&
+    row.cryptomus_uuid && c.env.CRYPTOMUS_MERCHANT_ID && c.env.CRYPTOMUS_PAYMENT_API_KEY
+  ) {
+    try {
+      const live = await cryptomusRequest(c.env, 'GET', `/payment/${row.cryptomus_uuid}`);
+      const mapped = mapCryptomusStatus(live.payment_status || live.status || '');
+      if (mapped === 'confirmed') {
+        await c.env.DB.prepare(
+          `UPDATE crypto_payments SET status = 'confirmed', paid_at = ?, finished_at = ?
+           WHERE order_id = ? AND status = 'waiting'`
+        ).bind(now, now, orderId).run();
+        row.status = 'confirmed';
+        row.paid_at = now;
+        row.finished_at = now;
+      } else if (mapped === 'failed' || mapped === 'expired') {
+        await c.env.DB.prepare(
+          `UPDATE crypto_payments SET status = ? WHERE order_id = ? AND status = 'waiting'`
+        ).bind(mapped, orderId).run();
+        row.status = mapped;
+      }
+    } catch (e: any) {
+      console.error(`[cryptomus] live status sync failed for ${orderId}:`, e.message);
+    }
+  }
+
+  const stillWaiting = now > row.expires_at && row.status === 'waiting';
   const payCurrency = row.pay_currency || 'xrp';
   const amountUnits = payCurrency === 'xrp' ? row.amount_xrp : row.amount_usdt;
   const fxRate = payCurrency === 'xrp' ? row.xrp_usd_rate : row.usdt_usd_rate;
   return c.json({
     ...row,
-    status: expired ? 'expired' : row.status,
+    status: stillWaiting ? 'expired' : row.status,
     pay_currency: payCurrency,
     pay_amount: amountUnits,
     fx_rate: fxRate,
   });
+});
+
+// Cryptomus 支付回调 — 验签:sign = md5(base64(rawBody) + PAYMENT_API_KEY)
+app.post('/api/crypto/webhook/cryptomus', async (c) => {
+  if (!c.env.CRYPTOMUS_PAYMENT_API_KEY) {
+    return c.json({ error: 'cryptomus not configured' }, 503);
+  }
+  const raw = await c.req.text();
+  const signHeader = c.req.header('sign') || '';
+  const expected = md5(btoa(raw) + c.env.CRYPTOMUS_PAYMENT_API_KEY);
+  if (signHeader !== expected) {
+    return c.json({ error: 'invalid signature' }, 403);
+  }
+
+  let payload: any;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return c.json({ error: 'invalid JSON body' }, 400);
+  }
+
+  const orderId = payload.order_id;
+  const mapped = mapCryptomusStatus(payload.status || payload.payment_status || '');
+  if (!orderId || mapped === 'waiting') {
+    // 中间态(check/process/confirm_check)无需落库
+    return c.json({ ok: true, ignored: true });
+  }
+
+  await ensureCryptoSchema(c.env);
+  const now = Math.floor(Date.now() / 1000);
+  if (mapped === 'confirmed') {
+    await c.env.DB.prepare(
+      `UPDATE crypto_payments
+       SET status = 'confirmed', paid_at = ?, finished_at = ?, cryptomus_uuid = ?
+       WHERE order_id = ? AND status IN ('waiting', 'confirmed')`
+    ).bind(now, now, payload.uuid || null, orderId).run();
+  } else {
+    // failed / expired — 不覆盖已确认订单
+    await c.env.DB.prepare(
+      `UPDATE crypto_payments SET status = ? WHERE order_id = ? AND status = 'waiting'`
+    ).bind(mapped, orderId).run();
+  }
+  return c.json({ ok: true });
 });
 
 
