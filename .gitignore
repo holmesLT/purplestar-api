@@ -8,3 +8,4 @@ out/
 dist/
 build/
 .wrangler-test/
+test-*.ts

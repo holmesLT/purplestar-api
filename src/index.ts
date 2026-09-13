@@ -175,6 +175,43 @@ async function requireAdmin(c: any): Promise<boolean> {
   return !!auth && auth === (c.env as any).ADMIN_KEY;
 }
 
+// 归集配置与 gas 赞助地址(需给赞助地址充少量 Arbitrum ETH,归集才能执行)
+app.get('/api/admin/sweep-info', async (c) => {
+  if (!(await requireAdmin(c))) return c.json({ error: 'unauthorized' }, 401);
+  const sponsor = deriveEvmKeypairFromMnemonic(c.env.XRP_MNEMONIC, SWEEP_SPONSOR_INDEX);
+  const sponsorTron = deriveTronAddressFromMnemonic(c.env.XRP_MNEMONIC, SWEEP_SPONSOR_INDEX);
+  return c.json({
+    evm: {
+      sponsor_address: sponsor.address,
+      sweep_dest: SWEEP_DEST_EVM,
+      note: 'Send ~0.0005-0.001 ETH (Arbitrum One) to sponsor_address once — it pays gas for all sweeps.',
+    },
+    tron: {
+      sponsor_address: sponsorTron.address,
+      note: 'TRC20 auto-sweep not implemented (energy cost). Use export-derivation-key + TronLink for manual withdrawal.',
+    },
+    sweep_min_usd: Number(SWEEP_MIN) / 1e6,
+  });
+});
+
+// 导出某个派生索引的私钥(敏感!用于 TronLink 手动提取 TRC20 收款)
+app.get('/api/admin/export-derivation-key', async (c) => {
+  if (!(await requireAdmin(c))) return c.json({ error: 'unauthorized' }, 401);
+  const index = parseInt(c.req.query('index') || '-1');
+  const currency = (c.req.query('currency') || 'usdt_trc20').toLowerCase();
+  if (!Number.isInteger(index) || index < 0) return c.json({ error: 'invalid index' }, 400);
+  if (currency === 'usdt_trc20') {
+    const kp = deriveTronAddressFromMnemonic(c.env.XRP_MNEMONIC, index);
+    const pk = deriveTronPrivateKeyFromMnemonic(c.env.XRP_MNEMONIC, index);
+    return c.json({ currency, index, address: kp.address, private_key_hex: pk });
+  }
+  if (currency === 'usdt_arb' || currency === 'usdc_arb') {
+    const kp = deriveEvmKeypairFromMnemonic(c.env.XRP_MNEMONIC, index);
+    return c.json({ currency, index, address: kp.address, private_key_hex: kp.private_key_hex });
+  }
+  return c.json({ error: 'unsupported currency' }, 400);
+});
+
 app.post('/api/admin/reset-hd-counters', async (c) => {
   if (!(await requireAdmin(c))) return c.json({ error: 'unauthorized' }, 401);
   try {
@@ -658,8 +695,10 @@ app.post('/indexnow', async (c) => {
 // ====================================================================
 
 import { deriveXrpAddressFromMnemonic } from './lib/xrp-hd';
-import { deriveTronAddressFromMnemonic } from './lib/tron-hd';
-import { deriveEvmAddressFromMnemonic } from './lib/evm-hd';
+import { deriveTronAddressFromMnemonic, deriveTronPrivateKeyFromMnemonic } from './lib/tron-hd';
+import { deriveEvmAddressFromMnemonic, deriveEvmKeypairFromMnemonic } from './lib/evm-hd';
+import { keccak_256 } from '@noble/hashes/sha3.js';
+import { secp256k1 } from '@noble/curves/secp256k1.js';
 
 // 方案 2.5 — 每单派生独立地址,稳定币直收(1 USDT/USDC ≈ $1,无需汇率换算)
 //   usdt_trc20 : USDT  on Tron (TRC20)     — 派生路径 m/44'/195'/0'/0/i,计数器 key 'usdt_trc20'
@@ -677,6 +716,193 @@ const ARB_TOKENS: Record<string, string> = {
 const ARBITRUM_RPC = 'https://arb1.arbitrum.io/rpc';
 // ERC-20 Transfer(address,address,uint256) 的 topic0
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+
+// ============================================================================
+// 自动归集 (sweep) — 把派生地址收到的稳定币转到用户主钱包
+//   EVM (Arbitrum): 全自动。gas 赞助账户 = 助记词 index 999999999(与订单地址不冲突),
+//     用户一次性给赞助地址充少量 ETH(约 0.0005 ETH 够几十次),每次归集 gas ≈ $0.0001。
+//   Tron: TRC20 转账需烧约 13.4 TRX 能力,自动归集成本高 — 采用
+//     /api/admin/export-derivation-key 导出私钥 + TronLink 手动提取。
+// ============================================================================
+
+const SWEEP_DEST_EVM = '0x428b574Ced1a7C76415E4666d0fA6440C85C0bE4';   // 用户 Trust Wallet (Arbitrum One)
+const SWEEP_SPONSOR_INDEX = 999999999;                                  // gas 赞助账户的派生索引
+const SWEEP_MIN = 1_000_000n;                                           // 最低归集余额 1 USDT (6 decimals)
+const SWEEP_GAS_WEI = 200_000n * 10n**7n;                               // 200k gas × 1 gwei 预算(实际远低于此)
+const SWEEP_GAS_TOPUP_WEI = 10n**15n;                                   // 每次补 0.001 ETH gas
+const ARB_CHAIN_ID = 42161n;
+
+// —— RLP 编码(仅覆盖本场景:整数 / 字节串 / 嵌套列表)——
+function rlpEncode(item: Uint8Array | Uint8Array[]): Uint8Array {
+  if (Array.isArray(item)) {
+    // 递归编码每个元素(否则长度前缀和空串全部丢失,交易非法)
+    const payload = concatBytes(...item.map(x => rlpEncode(x as Uint8Array)));
+    return wrapRlp(payload, 0xc0);
+  }
+  if (item.length === 1 && item[0] < 0x80) return item;
+  return wrapRlp(item, 0x80);
+}
+function wrapRlp(payload: Uint8Array, offset: number): Uint8Array {
+  if (payload.length <= 55) {
+    const out = new Uint8Array(payload.length + 1);
+    out[0] = offset + payload.length;
+    out.set(payload, 1);
+    return out;
+  }
+  const lenBytes = minimalBytes(BigInt(payload.length));
+  const out = new Uint8Array(payload.length + 1 + lenBytes.length);
+  out[0] = offset + 55 + lenBytes.length;
+  out.set(lenBytes, 1);
+  out.set(payload, 1 + lenBytes.length);
+  return out;
+}
+function minimalBytes(n: bigint): Uint8Array {
+  // EIP-155/RLP: 整数 0 必须编码为空字节串(nonce=0、value=0 时必须走空串)
+  if (n === 0n) return new Uint8Array(0);
+  const hex = n.toString(16).padStart(2, '0');
+  const bytes = hex.length % 2 ? '0' + hex : hex;
+  return Uint8Array.from(bytes.match(/.{2}/g)!.map(h => parseInt(h, 16)));
+}
+function intToMinimalBytes(n: bigint): Uint8Array { return minimalBytes(n); }
+function concatBytes(...arrays: Uint8Array[]): Uint8Array {
+  const total = arrays.reduce((a, b) => a + b.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const a of arrays) { out.set(a, off); off += a.length; }
+  return out;
+}
+function bytesToHex(b: Uint8Array): string { return '0x' + Array.from(b).map(x => x.toString(16).padStart(2, '0')).join(''); }
+function pad32Bytes(hexNoPrefix: string): Uint8Array {
+  let h = hexNoPrefix.replace(/^0x/, '');
+  if (h.length % 2) h = '0' + h;
+  const b = hexToBytes(h);
+  const out = new Uint8Array(32);
+  out.set(b, 32 - b.length);
+  return out;
+}
+
+// —— EVM 交易签名(EIP-155 legacy)+ 广播 ——
+async function signAndSendEvmTx(env: Env, fromIndex: number, to: string, value: bigint, data: string): Promise<string> {
+  const keypair = deriveEvmKeypairFromMnemonic(env.XRP_MNEMONIC, fromIndex);
+  const fromAddr = keypair.address_lowercase;
+
+  const nonce = BigInt(await arbRpc('eth_getTransactionCount', [fromAddr, 'pending']));
+  const gasPrice = BigInt(await arbRpc('eth_gasPrice', [])) * 12n / 10n + 10n**7n; // 抬 20% 避免卡单
+  const gasLimit = 300_000n;
+  const chainId = ARB_CHAIN_ID;
+
+  const unsigned = rlpEncode([
+    intToMinimalBytes(nonce),
+    intToMinimalBytes(gasPrice),
+    intToMinimalBytes(gasLimit),
+    hexToBytes(to.replace(/^0x/, '')),
+    intToMinimalBytes(value),
+    hexToBytes(data.replace(/^0x/, '')),
+    intToMinimalBytes(chainId),
+    new Uint8Array(0),
+    new Uint8Array(0),
+  ]);
+  const sighash = keccak_256(unsigned);
+  // noble v2: format 'compact' → 64 字节 r||s;恢复位需要自行确定
+  const sig64 = secp256k1.sign(sighash, hexToBytes(keypair.private_key_hex.replace(/^0x/, '')), { format: 'compact' });
+  const compressedPub = secp256k1.getPublicKey(hexToBytes(keypair.private_key_hex.slice(2)), true);
+  let recovery = 0n;
+  for (const recid of [0, 1]) {
+    const compact65 = new Uint8Array(65);
+    compact65[0] = recid;
+    compact65.set(sig64, 1);
+    const pub = secp256k1.recoverPublicKey(compact65, sighash, {});
+    if (bytesEqual(pub, compressedPub)) { recovery = BigInt(recid); break; }
+  }
+  const v = chainId * 2n + 35n + recovery;
+  const r = BigInt(bytesToHex(sig64.slice(0, 32)));
+  const s = BigInt(bytesToHex(sig64.slice(32, 64)));
+
+  const signed = rlpEncode([
+    intToMinimalBytes(nonce),
+    intToMinimalBytes(gasPrice),
+    intToMinimalBytes(gasLimit),
+    hexToBytes(to.replace(/^0x/, '')),
+    intToMinimalBytes(value),
+    hexToBytes(data.replace(/^0x/, '')),
+    intToMinimalBytes(v),
+    intToMinimalBytes(r),
+    intToMinimalBytes(s),
+  ]);
+  return await arbRpc('eth_sendRawTransaction', [bytesToHex(signed)]);
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+async function erc20BalanceOf(token: string, holder: string): Promise<bigint> {
+  const data = '0x70a08231' + bytesToHex(pad32Bytes(holder.replace(/^0x/, '')));
+  const result: string = await arbRpc('eth_call', [{ to: token, data }, 'latest']);
+  return BigInt(result);
+}
+
+async function sweepEvmOrders(env: Env): Promise<{ attempted: number; swept: number }> {
+  let attempted = 0, swept = 0;
+  const rows = await env.DB.prepare(
+    `SELECT order_id, address, derivation_index, pay_currency, amount_usdt, swept
+     FROM crypto_payments
+     WHERE status IN ('finished', 'confirmed') AND swept IN (0, 1)
+       AND pay_currency IN ('usdt_arb', 'usdc_arb')
+     ORDER BY created_at ASC LIMIT 20`
+  ).all<any>();
+
+  for (const p of rows.results || []) {
+    try {
+      const token = ARB_TOKENS[p.pay_currency];
+      const tokenBalance = await erc20BalanceOf(token, p.address);
+      if (tokenBalance === 0n) {
+        // 地址空(可能已手动转走)— 标记完成
+        await env.DB.prepare(`UPDATE crypto_payments SET swept = 2 WHERE order_id = ?`).bind(p.order_id).run();
+        continue;
+      }
+      if (tokenBalance < SWEEP_MIN) continue; // 低于 1 USDT 暂不归集
+
+      const ethBalance = BigInt(await arbRpc('eth_getBalance', [p.address, 'latest']));
+      const sweepValue = tokenBalance; // 全额转出
+
+      if (ethBalance < SWEEP_GAS_WEI) {
+        // 阶段 1:赞助账户给派生地址补 gas(只在 swept=0 时补一次,避免重复)
+        if (p.swept === 0) {
+          attempted++;
+          const sponsorBal = BigInt(await arbRpc('eth_getBalance', [
+            deriveEvmKeypairFromMnemonic(env.XRP_MNEMONIC, SWEEP_SPONSOR_INDEX).address_lowercase, 'latest',
+          ]));
+          if (sponsorBal < SWEEP_GAS_WEI + 10n**13n) {
+            console.error(`[sweep] gas sponsor underfunded — send ETH (Arbitrum One) to the sponsor address`);
+            continue;
+          }
+          await signAndSendEvmTx(env, SWEEP_SPONSOR_INDEX, p.address, SWEEP_GAS_TOPUP_WEI, '0x');
+          await env.DB.prepare(`UPDATE crypto_payments SET swept = 1 WHERE order_id = ?`).bind(p.order_id).run();
+          console.log(`[sweep] gas topped up for ${p.order_id}`);
+        }
+        continue; // 等 gas 到位,下一轮 cron 再归集
+      }
+
+      // 阶段 2:归集 — 派生地址把全部 USDT/USDC 转到目标钱包
+      attempted++;
+      const data = '0xa9059cbb'
+        + bytesToHex(pad32Bytes(SWEEP_DEST_EVM.replace(/^0x/, '')))
+        + bytesToHex(pad32Bytes(sweepValue.toString(16)));
+      const txHash = await signAndSendEvmTx(env, p.derivation_index ?? SWEEP_SPONSOR_INDEX, token, 0n, data);
+      await env.DB.prepare(
+        `UPDATE crypto_payments SET swept = 2, swept_tx = ? WHERE order_id = ?`
+      ).bind(txHash, p.order_id).run();
+      swept++;
+      console.log(`[sweep] swept ${sweepValue} of ${p.pay_currency} from ${p.order_id} → ${SWEEP_DEST_EVM} tx=${txHash}`);
+    } catch (err: any) {
+      console.error(`[sweep] error for ${p.order_id}: ${err.message}`);
+    }
+  }
+  return { attempted, swept };
+}
 
 const SELF_TIER_AMOUNTS: Record<string, { usd: number; product: string; expires_sec: number }> = {
   basic: { usd: 3.99, product: 'PurpleStar AI Reading', expires_sec: 1800 },   // 30 min — 与 Stripe 价格一致
@@ -808,6 +1034,9 @@ async function ensureCryptoSchema(env: Env): Promise<void> {
       // 方案 2.5 扩展列
       `ALTER TABLE crypto_payments ADD COLUMN from_block INTEGER`,      // EVM 扫描起始块
       `ALTER TABLE crypto_payments ADD COLUMN claimed_txid TEXT`,       // 用户手动申报的 TXID
+      // 归集状态:0=待归集 1=gas已补 2=已归集/无需归集
+      `ALTER TABLE crypto_payments ADD COLUMN swept INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE crypto_payments ADD COLUMN swept_tx TEXT`,
       `CREATE INDEX IF NOT EXISTS idx_crypto_payments_currency ON crypto_payments(pay_currency)`,
     ];
     for (const sql of stmts) {
@@ -1426,6 +1655,12 @@ async function handleScheduled(event: ScheduledEvent, env: Env, ctx: ExecutionCo
     watchCryptoPayments(env).then(r =>
       console.log(`[cron] watcher: scanned=${r.scanned} confirmed=${r.confirmed} expired=${r.expired}`)
     ).catch(e => console.error('[cron] watcher error:', e))
+  );
+  // 自动归集:确认订单的 Arbitrum 稳定币 → 用户主钱包
+  ctx.waitUntil(
+    sweepEvmOrders(env).then(r =>
+      console.log(`[cron] sweep: attempted=${r.attempted} swept=${r.swept}`)
+    ).catch(e => console.error('[cron] sweep error:', e))
   );
 }
 

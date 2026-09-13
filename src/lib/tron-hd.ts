@@ -35,6 +35,7 @@ const bs58check: { encode(buf: Uint8Array): string; decode(s: string): Uint8Arra
 export interface DerivedTronAddress {
   index: number;
   address: string;     // base58check 'T...' Tron address
+  private_key_hex: string; // SENSITIVE — admin export / sweeping only
   pubkey_uncompressed: string; // 0x04 || X || Y (65 bytes hex)
 }
 
@@ -69,9 +70,11 @@ export function deriveTronAddressFromMnemonic(
   const seed = bip39.mnemonicToSeedSync(mnemonic, passphrase);
   const master = HDKey.fromMasterSeed(seed);
   const child = master.derive(`m/44'/195'/0'/0/${index}`);
+  if (!child.privateKey) throw new Error('Failed to derive private key');
   if (!child.publicKey) throw new Error('Failed to derive public key');
 
   const pubCompressed = child.publicKey; // 33 bytes, 0x02|0x03 prefix
+  const privateKeyHex = Array.from(child.privateKey).map(b => b.toString(16).padStart(2, '0')).join('');
   // uncompress to 64 bytes (X || Y, no 0x04 prefix)
   const xy = uncompressPublicKey(pubCompressed);
 
@@ -93,6 +96,26 @@ export function deriveTronAddressFromMnemonic(
   return {
     index,
     address,
+    private_key_hex: privateKeyHex,
     pubkey_uncompressed: Array.from(pubUncompressed).map(b => b.toString(16).padStart(2, '0')).join(''),
   };
+}
+
+/**
+ * Derive the raw secp256k1 private key (hex, no 0x) for a Tron derivation index.
+ * Same key that controls the derived address — admin key export / sweeping only.
+ */
+export function deriveTronPrivateKeyFromMnemonic(
+  mnemonic: string,
+  index: number,
+  passphrase: string = '',
+): string {
+  if (!bip39.validateMnemonic(mnemonic, wordlist)) {
+    throw new Error('Invalid BIP39 mnemonic');
+  }
+  const seed = bip39.mnemonicToSeedSync(mnemonic, passphrase);
+  const master = HDKey.fromMasterSeed(seed);
+  const child = master.derive(`m/44'/195'/0'/0/${index}`);
+  if (!child.privateKey) throw new Error('Failed to derive private key');
+  return Array.from(child.privateKey).map(b => b.toString(16).padStart(2, '0')).join('');
 }

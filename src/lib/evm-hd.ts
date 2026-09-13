@@ -26,6 +26,10 @@ export interface DerivedEvmAddress {
   address_lowercase: string;
 }
 
+export interface DerivedEvmKeypair extends DerivedEvmAddress {
+  private_key_hex: string;  // 0x... 32-byte private key (SENSITIVE — admin export only)
+}
+
 function toChecksumAddress(addrHexLower: string): string {
   // EIP-55: keccak-256 of the lowercase hex string (ASCII, no 0x) drives the case of each hex char
   const addr = addrHexLower.replace(/^0x/, '');
@@ -65,5 +69,24 @@ export function deriveEvmAddressFromMnemonic(
     index,
     address: toChecksumAddress(addrLower),
     address_lowercase: addrLower,
+  };
+}
+
+export function deriveEvmKeypairFromMnemonic(
+  mnemonic: string,
+  index: number,
+  passphrase: string = '',
+): DerivedEvmKeypair {
+  if (!bip39.validateMnemonic(mnemonic, wordlist)) {
+    throw new Error('Invalid BIP39 mnemonic');
+  }
+  const seed = bip39.mnemonicToSeedSync(mnemonic, passphrase);
+  const master = HDKey.fromMasterSeed(seed);
+  const child = master.derive(`m/44'/60'/0'/0/${index}`);
+  if (!child.privateKey) throw new Error('Failed to derive private key');
+  const base = deriveEvmAddressFromMnemonic(mnemonic, index, passphrase);
+  return {
+    ...base,
+    private_key_hex: '0x' + Array.from(child.privateKey).map(b => b.toString(16).padStart(2, '0')).join(''),
   };
 }
