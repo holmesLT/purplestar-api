@@ -659,6 +659,24 @@ app.post('/indexnow', async (c) => {
 
 import { deriveXrpAddressFromMnemonic } from './lib/xrp-hd';
 import { deriveTronAddressFromMnemonic } from './lib/tron-hd';
+import { deriveEvmAddressFromMnemonic } from './lib/evm-hd';
+
+// 方案 2.5 — 每单派生独立地址,稳定币直收(1 USDT/USDC ≈ $1,无需汇率换算)
+//   usdt_trc20 : USDT  on Tron (TRC20)     — 派生路径 m/44'/195'/0'/0/i,计数器 key 'usdt_trc20'
+//   usdt_arb   : USDT  on Arbitrum One     — 派生路径 m/44'/60'/0'/0/i, 计数器 key 'evm'
+//   usdc_arb   : USDC  on Arbitrum One     — 同上,与 usdt_arb 共享 'evm' 计数器(同链同地址格式)
+// EVM 地址两条链通用,故 usdt_arb / usdc_arb 必须共用计数器才能保证地址按订单唯一。
+const SUPPORTED_PAY_CURRENCIES = ['usdt_trc20', 'usdt_arb', 'usdc_arb'] as const;
+type PayCurrency = typeof SUPPORTED_PAY_CURRENCIES[number];
+
+// Arbitrum One 上的 ERC-20 合约(均为 6 位小数)
+const ARB_TOKENS: Record<string, string> = {
+  usdt_arb: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9', // USDT
+  usdc_arb: '0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8', // USDC (bridged)
+};
+const ARBITRUM_RPC = 'https://arb1.arbitrum.io/rpc';
+// ERC-20 Transfer(address,address,uint256) 的 topic0
+const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
 const SELF_TIER_AMOUNTS: Record<string, { usd: number; product: string; expires_sec: number }> = {
   basic: { usd: 3.99, product: 'PurpleStar AI Reading', expires_sec: 1800 },   // 30 min — 与 Stripe 价格一致
@@ -783,10 +801,13 @@ async function ensureCryptoSchema(env: Env): Promise<void> {
       `ALTER TABLE crypto_payments ADD COLUMN usdt_usd_rate REAL`,
       `ALTER TABLE crypto_payments ADD COLUMN amount_btc REAL`,
       `ALTER TABLE crypto_payments ADD COLUMN btc_usd_rate REAL`,
-      // Cryptomus(方案 B)扩展列
+      // Cryptomus(方案 B)扩展列 — 已弃用(项目被拒审),保留列避免历史数据丢失
       `ALTER TABLE crypto_payments ADD COLUMN processor TEXT NOT NULL DEFAULT 'self_hd'`,
       `ALTER TABLE crypto_payments ADD COLUMN cryptomus_uuid TEXT`,
       `ALTER TABLE crypto_payments ADD COLUMN invoice_url TEXT`,
+      // 方案 2.5 扩展列
+      `ALTER TABLE crypto_payments ADD COLUMN from_block INTEGER`,      // EVM 扫描起始块
+      `ALTER TABLE crypto_payments ADD COLUMN claimed_txid TEXT`,       // 用户手动申报的 TXID
       `CREATE INDEX IF NOT EXISTS idx_crypto_payments_currency ON crypto_payments(pay_currency)`,
     ];
     for (const sql of stmts) {
@@ -819,100 +840,45 @@ app.post('/api/crypto/create-payment', async (c) => {
       ).bind(body.chartId, '{}', JSON.stringify(body.chart), now0 + 86400).run();
     }
 
-    // ===== Cryptomus 托管收银台(方案 B)=====
-    // 配置了密钥即启用:托管页支持 200+ 币种,用户自选币种/网络,
-    // 无需 HD 地址派生与链上对账,资金自动归集到 Cryptomus 钱包。
-    if (c.env.CRYPTOMUS_MERCHANT_ID && c.env.CRYPTOMUS_PAYMENT_API_KEY) {
-      const { usd, expires_sec } = SELF_TIER_AMOUNTS[tier];
-      const orderId = crypto.randomUUID();
-      const frontendBase = (c.env.SITE_URL || 'https://purplestar.cc').replace(/\/$/, '');
-      const invoice = await cryptomusRequest(c.env, 'POST', '/payment', {
-        amount: usd.toFixed(2),
-        currency: 'USD',
-        order_id: orderId,
-        url_callback: CRYPTOMUS_WEBHOOK_URL,
-        url_return: `${frontendBase}/payment-return-crypto/?order_id=${orderId}&tier=${tier}`,
-        url_success: `${frontendBase}/report/?chartId=${body.chartId || ''}&tier=${tier}&self_crypto_order_id=${orderId}`,
-        lifetime: Math.max(CRYPTOMUS_LIFETIME_SEC, expires_sec),
-      });
-
-      const now = Math.floor(Date.now() / 1000);
-      await c.env.DB.prepare(
-        `INSERT INTO crypto_payments
-           (order_id, address, derivation_index, pay_currency, tier, chart_id,
-            amount_xrp, amount_usd, xrp_usd_rate,
-            status, expires_at, created_at,
-            processor, cryptomus_uuid, invoice_url)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?, 'cryptomus', ?, ?)`
-      ).bind(
-        orderId,
-        invoice.url,        // address 列 UNIQUE NOT NULL — 托管模式下存发票 URL(每单唯一)
-        -1,                 // 非 HD 派生单
-        'cryptomus',
-        tier,
-        body.chartId || null,
-        0,
-        usd,
-        0,
-        now + expires_sec,
-        now,
-        invoice.uuid,
-        invoice.url,
-      ).run();
-
-      return c.json({
-        ok: true,
-        processor: 'cryptomus',
-        order_id: orderId,
-        invoice_url: invoice.url,
-        amount_usd: usd,
-        tier,
-        expires_at: now + expires_sec,
-      });
-    }
-
-    // ===== 自托管 HD 钱包路径(无 Cryptomus 密钥时的后备)=====
-    const payCurrency = (body.pay_currency || 'xrp').toLowerCase();
-    if (!['xrp', 'usdt_trc20'].includes(payCurrency)) {
-      return c.json({ error: `pay_currency must be one of: xrp, usdt_trc20 (got: ${payCurrency})` }, 400);
+    // ===== 方案 2.5 — 每单派生独立地址,稳定币直收 =====
+    //   用户钱包 → 我们的派生地址(链上),无任何第三方;资金 100% 自托管。
+    //   地址按订单唯一 → 归因确定,无撞单;金额 1:1 美元,无汇率换算。
+    const payCurrency = (body.pay_currency || 'usdt_trc20').toLowerCase() as PayCurrency;
+    if (!(SUPPORTED_PAY_CURRENCIES as readonly string[]).includes(payCurrency)) {
+      return c.json({ error: `pay_currency must be one of: ${SUPPORTED_PAY_CURRENCIES.join(', ')} (got: ${payCurrency})` }, 400);
     }
     const { usd, expires_sec } = SELF_TIER_AMOUNTS[tier];
 
-    // 派生新地址(每币种独立 HD index)
     const orderId = crypto.randomUUID();
-    const derivationIndex = await allocateNextDerivationIndex(c.env, payCurrency);
-    let address: string;
-    let payAmount: number;
-    let fxRate: number;
+    // EVM 两币种(usdt_arb / usdc_arb)同链同地址格式,必须共用 'evm' 计数器才能按订单唯一
+    const counterKey = payCurrency === 'usdt_trc20' ? 'usdt_trc20' : 'evm';
+    const derivationIndex = await allocateNextDerivationIndex(c.env, counterKey);
 
-    if (payCurrency === 'xrp') {
-      const derived = deriveXrpAddressFromMnemonic(c.env.XRP_MNEMONIC, derivationIndex);
-      address = derived.address;
-      const xrpUsd = await getXrpUsdRate(c.env);
-      fxRate = xrpUsd;
-      payAmount = Math.ceil((usd / xrpUsd) * 1.05 * 1_000_000) / 1_000_000; // 6 位精度,向上取整
+    let address: string;
+    let fromBlock: number | null = null;
+    if (payCurrency === 'usdt_trc20') {
+      address = deriveTronAddressFromMnemonic(c.env.XRP_MNEMONIC, derivationIndex).address;
     } else {
-      // usdt_trc20 — Tron HD wallet
-      const derived = deriveTronAddressFromMnemonic(c.env.XRP_MNEMONIC, derivationIndex);
-      address = derived.address;
-      const usdtUsd = await getUsdtUsdRate(c.env);
-      fxRate = usdtUsd;
-      // USDT TRC20 6 decimals,与 XRP 一致精度
-      payAmount = Math.ceil((usd / usdtUsd) * 1.05 * 1_000_000) / 1_000_000;
+      address = deriveEvmAddressFromMnemonic(c.env.XRP_MNEMONIC, derivationIndex).address_lowercase;
+      // 记录建单时区块号,watcher 只扫这之后的 Transfer 日志
+      const bnResp = await fetch(ARBITRUM_RPC, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] }),
+      });
+      const bnJson: any = await bnResp.json().catch(() => null);
+      if (!bnJson?.result) throw new Error(`Arbitrum RPC eth_blockNumber failed (${bnResp.status})`);
+      fromBlock = parseInt(bnJson.result, 16);
     }
 
     const now = Math.floor(Date.now() / 1000);
-    // 通用 INSERT — amount_xrp / xrp_usd_rate 原始 schema 是 NOT NULL,usdt 订单必须填 0 才能过约束
-    const amountXrpForRow = payCurrency === 'xrp' ? payAmount : 0;
-    const amountUsdtForRow = payCurrency === 'usdt_trc20' ? payAmount : null;
-    const xrpRateForRow = payCurrency === 'xrp' ? fxRate : 0;  // NOT NULL column
-    const usdtRateForRow = payCurrency === 'usdt_trc20' ? fxRate : null;
+    // 稳定币 1:1 美元 — 金额统一存 amount_usdt(通用 6 位小数金额列),usdt_usd_rate = 1
     await c.env.DB.prepare(
       `INSERT INTO crypto_payments
          (order_id, address, derivation_index, pay_currency, tier, chart_id,
           amount_xrp, amount_usd, xrp_usd_rate, amount_usdt, usdt_usd_rate,
-          status, expires_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?)`
+          status, expires_at, created_at, processor, from_block)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, 1, ?, 1, 'waiting', ?, ?, 'self_hd', ?)`
     ).bind(
       orderId,
       address,
@@ -920,23 +886,20 @@ app.post('/api/crypto/create-payment', async (c) => {
       payCurrency,
       tier,
       body.chartId || null,
-      amountXrpForRow,
       usd,
-      xrpRateForRow,
-      amountUsdtForRow,
-      usdtRateForRow,
+      usd,
       now + expires_sec,
       now,
+      fromBlock,
     ).run();
 
     return c.json({
       ok: true,
       order_id: orderId,
       pay_address: address,
-      pay_amount: payAmount,
+      pay_amount: usd,
       pay_currency: payCurrency,
       amount_usd: usd,
-      fx_rate: fxRate,
       tier,
       expires_at: now + expires_sec,
       expires_in_sec: expires_sec,
@@ -955,7 +918,7 @@ app.get('/api/crypto/payment/:orderId', async (c) => {
             amount_xrp, amount_usd, xrp_usd_rate,
             amount_usdt, usdt_usd_rate,
             status, tx_hash, paid_at, expires_at, created_at, finished_at,
-            processor, cryptomus_uuid, invoice_url
+            processor, cryptomus_uuid, invoice_url, from_block, claimed_txid
      FROM crypto_payments WHERE order_id = ?`
   ).bind(orderId).first<any>();
   if (!row) return c.json({ error: 'payment not found' }, 404);
@@ -989,6 +952,27 @@ app.get('/api/crypto/payment/:orderId', async (c) => {
     }
   }
 
+  // 方案 2.5 — 派生地址订单:状态查询时顺带做一次链上扫描(cron 是 2 分钟兜底,这里秒级响应)
+  if (
+    row.processor === 'self_hd' && row.status === 'waiting' && !expired &&
+    (SUPPORTED_PAY_CURRENCIES as readonly string[]).includes(row.pay_currency)
+  ) {
+    try {
+      if (await scanOrderIncoming(c.env, row, now)) {
+        const updated = await c.env.DB.prepare(
+          `SELECT order_id, address, derivation_index, pay_currency, tier, chart_id,
+                  amount_xrp, amount_usd, xrp_usd_rate, amount_usdt, usdt_usd_rate,
+                  status, tx_hash, paid_at, expires_at, created_at, finished_at,
+                  processor, from_block, claimed_txid
+           FROM crypto_payments WHERE order_id = ?`
+        ).bind(orderId).first<any>();
+        if (updated) Object.assign(row, updated);
+      }
+    } catch (e: any) {
+      console.error(`[scan] live scan failed for ${orderId}: ${e.message}`);
+    }
+  }
+
   const stillWaiting = now > row.expires_at && row.status === 'waiting';
   const payCurrency = row.pay_currency || 'xrp';
   const amountUnits = payCurrency === 'xrp' ? row.amount_xrp : row.amount_usdt;
@@ -999,6 +983,24 @@ app.get('/api/crypto/payment/:orderId', async (c) => {
     pay_currency: payCurrency,
     pay_amount: amountUnits,
     fx_rate: fxRate,
+  });
+});
+
+// 用户手动申报付款(TXID 兜底:链上自动核对万一漏单时的人工通道)
+// 申报仅落库待人工核对,不自动解锁 — 防止伪造 TXID 白嫖报告
+app.post('/api/crypto/claim', async (c) => {
+  await ensureCryptoSchema(c.env);
+  const body = await c.req.json().catch(() => null) as { order_id?: string; txid?: string } | null;
+  if (!body?.order_id || !body?.txid) return c.json({ error: 'order_id and txid required' }, 400);
+  const txid = body.txid.trim();
+  if (txid.length < 10 || txid.length > 128) return c.json({ error: 'invalid txid' }, 400);
+  const r = await c.env.DB.prepare(
+    `UPDATE crypto_payments SET claimed_txid = ? WHERE order_id = ? AND status = 'waiting'`
+  ).bind(txid, body.order_id).run();
+  if (!r.meta.changes) return c.json({ error: 'order not found or not waiting' }, 404);
+  return c.json({
+    ok: true,
+    note: 'Claim recorded. We will verify the transaction on-chain and unlock your reading shortly.',
   });
 });
 
@@ -1263,11 +1265,123 @@ async function fetchTronTrc20Txs(address: string, limit = 20): Promise<any[]> {
   return j?.data || [];
 }
 
+// EVM (Arbitrum One) 入账扫描 — eth_getLogs 查 ERC-20 Transfer 日志(to = 派生地址)
+// 公共 RPC 对单次区块范围有限制,按 5000 块分片(Arbitrum 出块 ~0.25s,30 分钟 ≈ 7200 块)
+async function fetchArbTransfers(token: string, toAddress: string, fromBlock: number): Promise<any[]> {
+  const paddedTopic = '0x' + '0'.repeat(24) + toAddress.replace(/^0x/, '').toLowerCase();
+  const latestResp = await fetch(ARBITRUM_RPC, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] }),
+  });
+  const latestJson: any = await latestResp.json().catch(() => null);
+  if (!latestJson?.result) throw new Error(`Arbitrum RPC eth_blockNumber failed (${latestResp.status})`);
+  const latest = parseInt(latestJson.result, 16);
+
+  const all: any[] = [];
+  const CHUNK = 5000;
+  for (let start = Math.max(0, fromBlock); start <= latest; start += CHUNK) {
+    const end = Math.min(start + CHUNK - 1, latest);
+    const r = await fetch(ARBITRUM_RPC, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'eth_getLogs',
+        params: [{ address: token, fromBlock: '0x' + start.toString(16), toBlock: '0x' + end.toString(16), topics: [TRANSFER_TOPIC, null, paddedTopic] }],
+      }),
+    });
+    const j: any = await r.json().catch(() => null);
+    if (j?.error) throw new Error(`eth_getLogs error: ${JSON.stringify(j.error)}`);
+    all.push(...(j?.result || []));
+    if (end >= latest) break;
+  }
+  return all;
+}
+
+/**
+ * 扫描单个订单的链上入账;收款 ≥ 应付 × 0.95 则确认订单(写库 + 记 tx_hash)。
+ * 供 cron watcher(全部待付订单)和状态查询路由(单订单实时扫)共用。
+ * 返回是否发生了确认。
+ */
+async function scanOrderIncoming(env: Env, p: any, now: number): Promise<boolean> {
+  const payCurrency = p.pay_currency || 'xrp';
+
+  if (payCurrency === 'xrp') {
+    // XRP — XRPL account_tx
+    const txs = await fetchAccountTxs(p.address, 20);
+    for (const t of txs) {
+      if (t.tx?.Destination !== p.address) continue;
+      if (t.meta?.TransactionResult && t.meta.TransactionResult !== 'tesSUCCESS') continue;
+      const amt = t.tx.Amount;
+      const drops = typeof amt === 'string' ? amt : null;
+      if (!drops) continue;
+      const xrpReceived = Number(drops) / 1_000_000;
+      if (xrpReceived >= p.amount_xrp * 0.95) {
+        await env.DB.prepare(
+          `UPDATE crypto_payments
+           SET status = 'finished', tx_hash = ?, paid_at = ?, finished_at = ?
+           WHERE order_id = ? AND status IN ('waiting', 'confirming')`
+        ).bind(t.tx.hash, now, now, p.order_id).run();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (payCurrency === 'usdt_trc20') {
+    // USDT TRC20 — TronGrid /v1/accounts/{addr}/transactions/trc20
+    const trc20Txs = await fetchTronTrc20Txs(p.address, 20);
+    const USDT_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
+    for (const tx of trc20Txs) {
+      if (tx.token_info?.address !== USDT_CONTRACT) continue;
+      if (tx.to !== p.address) continue;
+      if (tx.confirmations !== undefined && tx.confirmations < 1) continue;
+      const raw = tx.value || tx.amount_str;
+      if (!raw) continue;
+      // trongrid 有时返回已除以 10^6 的数值,有时是原始 6 位小数字符串
+      const received = typeof raw === 'number' ? raw : Number(raw) / 1_000_000;
+      if (received >= p.amount_usdt * 0.95) {
+        await env.DB.prepare(
+          `UPDATE crypto_payments
+           SET status = 'finished', tx_hash = ?, paid_at = ?, finished_at = ?
+           WHERE order_id = ? AND status IN ('waiting', 'confirming')`
+        ).bind(tx.transaction_id, now, now, p.order_id).run();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (payCurrency === 'usdt_arb' || payCurrency === 'usdc_arb') {
+    const token = ARB_TOKENS[payCurrency];
+    const logs = await fetchArbTransfers(token, p.address, p.from_block ?? 0);
+    let received = 0;
+    let txHash: string | null = null;
+    const paddedTopic = '0x' + '0'.repeat(24) + p.address.replace(/^0x/, '').toLowerCase();
+    for (const log of logs) {
+      if (!log.topics || log.topics[2]?.toLowerCase() !== paddedTopic) continue;
+      received += Number(BigInt(log.data)) / 1e6;
+      if (!txHash) txHash = log.transactionHash;
+    }
+    if (received >= p.amount_usdt * 0.95 && txHash) {
+      await env.DB.prepare(
+        `UPDATE crypto_payments
+         SET status = 'finished', tx_hash = ?, paid_at = ?, finished_at = ?
+         WHERE order_id = ? AND status IN ('waiting', 'confirming')`
+      ).bind(txHash, now, now, p.order_id).run();
+      return true;
+    }
+    return false;
+  }
+
+  return false;
+}
+
 async function watchCryptoPayments(env: Env): Promise<{ scanned: number; confirmed: number; expired: number }> {
   const now = Math.floor(Date.now() / 1000);
-  // 取所有未完成且未过期的订单,包含 pay_currency 和 amount 字段
+  // 取所有未完成且未过期的订单(含方案 2.5 的三个币种和旧 xrp 单)
   const pending = await env.DB.prepare(
-    `SELECT order_id, address, pay_currency, amount_xrp, amount_usdt, status, expires_at, created_at, tier
+    `SELECT order_id, address, pay_currency, amount_xrp, amount_usdt, amount_usd, status, expires_at, created_at, tier, from_block
      FROM crypto_payments
      WHERE status IN ('waiting', 'confirming') AND expires_at > ?
      ORDER BY created_at ASC
@@ -1277,61 +1391,9 @@ async function watchCryptoPayments(env: Env): Promise<{ scanned: number; confirm
   let confirmed = 0;
   for (const p of pending.results || []) {
     try {
-      const payCurrency = p.pay_currency || 'xrp';
-      if (payCurrency === 'xrp') {
-        // XRP — XRPL account_tx
-        const txs = await fetchAccountTxs(p.address, 20);
-        for (const t of txs) {
-          if (t.tx?.Destination !== p.address) continue;
-          if (t.meta?.TransactionResult && t.meta.TransactionResult !== 'tesSUCCESS') continue;
-          const amt = t.tx.Amount;
-          const drops = typeof amt === 'string' ? amt : null;
-          if (!drops) continue;
-          const xrpReceived = Number(drops) / 1_000_000;
-          if (xrpReceived >= p.amount_xrp * 0.95) {
-            const txHash = t.tx.hash;
-            await env.DB.prepare(
-              `UPDATE crypto_payments
-               SET status = 'finished', tx_hash = ?, paid_at = ?, finished_at = ?
-               WHERE order_id = ? AND status IN ('waiting', 'confirming')`
-            ).bind(txHash, now, now, p.order_id).run();
-            confirmed++;
-            console.log(`[watcher/xrp] finished order=${p.order_id} addr=${p.address} tx=${txHash} received=${xrpReceived} XRP`);
-            break;
-          }
-        }
-      } else if (payCurrency === 'usdt_trc20') {
-        // USDT TRC20 — TronGrid /v1/accounts/{addr}/transactions/trc20
-        const trc20Txs = await fetchTronTrc20Txs(p.address, 20);
-        const USDT_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
-        for (const tx of trc20Txs) {
-          if (tx.token_info?.address !== USDT_CONTRACT) continue;
-          if (tx.to !== p.address) continue;
-          // confirmed status — block too deep = unconfirmed
-          // trongrid returns confirmations from block height; treat confirmed=true if present
-          if (tx.confirmations !== undefined && tx.confirmations < 1) continue;
-          // amount: USDT TRC20 6 decimals — string
-          const raw = tx.value || tx.amount_str;
-          if (!raw) continue;
-          // trongrid sometimes returns numeric amount (already divided by 10^6); sometimes raw 6-decimal string
-          let received: number;
-          if (typeof raw === 'number') {
-            received = raw;
-          } else {
-            received = Number(raw) / 1_000_000;
-          }
-          if (received >= p.amount_usdt * 0.95) {
-            const txHash = tx.transaction_id;
-            await env.DB.prepare(
-              `UPDATE crypto_payments
-               SET status = 'finished', tx_hash = ?, paid_at = ?, finished_at = ?
-               WHERE order_id = ? AND status IN ('waiting', 'confirming')`
-            ).bind(txHash, now, now, p.order_id).run();
-            confirmed++;
-            console.log(`[watcher/usdt] finished order=${p.order_id} addr=${p.address} tx=${txHash} received=${received} USDT`);
-            break;
-          }
-        }
+      if (await scanOrderIncoming(env, p, now)) {
+        confirmed++;
+        console.log(`[watcher/${p.pay_currency}] confirmed order=${p.order_id} addr=${p.address}`);
       }
     } catch (err: any) {
       console.log(`[watcher] error for ${p.address}: ${err.message}`);
