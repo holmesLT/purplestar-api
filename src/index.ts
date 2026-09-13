@@ -189,6 +189,27 @@ app.post('/api/admin/sweep-now', async (c) => {
   }
 });
 
+app.get('/api/admin/rpc-diag', async (c) => {
+  if (c.req.header('x-admin-key') !== c.env.ADMIN_KEY) return c.json({ error: 'unauthorized' }, 403);
+  const endpoints = c.env.ARBITRUM_RPC_URL ? [c.env.ARBITRUM_RPC_URL, ...ARBITUM_RPCS] : ARBITUM_RPCS;
+  const results: any[] = [];
+  for (const rpc of endpoints) {
+    try {
+      const r = await fetch(rpc, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] }),
+      });
+      let body: any = null;
+      try { body = await r.json(); } catch { try { body = (await r.text()).slice(0, 120); } catch {} }
+      results.push({ rpc: rpc.slice(0, 60), status: r.status, ok: !!body?.result, result: body?.result ?? String(body?.message ?? '').slice(0, 80) });
+    } catch (err: any) {
+      results.push({ rpc: rpc.slice(0, 60), error: err.message.slice(0, 120) });
+    }
+  }
+  return c.json({ has_custom: !!c.env.ARBITRUM_RPC_URL, results });
+});
+
 app.get('/api/admin/sweep-info', async (c) => {
   if (!(await requireAdmin(c))) return c.json({ error: 'unauthorized' }, 401);
   const sponsor = deriveEvmKeypairFromMnemonic(c.env.XRP_MNEMONIC, SWEEP_SPONSOR_INDEX);
@@ -817,15 +838,25 @@ async function signAndSendEvmTx(env: Env, fromIndex: number, to: string, value: 
   ]);
   const sighash = keccak_256(unsigned);
   // noble v2: format 'compact' → 64 字节 r||s;恢复位需要自行确定
-  const sig64 = secp256k1.sign(sighash, hexToBytes(keypair.private_key_hex.replace(/^0x/, '')), { format: 'compact' });
+  const sig64 = secp256k1.sign(sighash, hexToBytes(keypair.private_key_hex.replace(/^0x/, '')), { format: 'compact', prehash: false });
   const compressedPub = secp256k1.getPublicKey(hexToBytes(keypair.private_key_hex.slice(2)), true);
   let recovery = 0n;
+  let found = false;
+  let diag = '';
   for (const recid of [0, 1]) {
     const compact65 = new Uint8Array(65);
     compact65[0] = recid;
     compact65.set(sig64, 1);
-    const pub = secp256k1.recoverPublicKey(compact65, sighash, {});
-    if (bytesEqual(pub, compressedPub)) { recovery = BigInt(recid); break; }
+    const pub = secp256k1.recoverPublicKey(compact65, sighash, { prehash: false });
+    // 正确的地址计算:解压公钥取 X||Y,keccak 后取末 20 字节
+    const xy = secp256k1.Point.fromBytes(pub).toBytes(false).slice(1, 65);
+    const recAddr = '0x' + bytesToHex(keccak_256(xy)).slice(2).slice(-40);
+    const verifyOk = secp256k1.verify(sig64, sighash, pub, { prehash: false });
+    diag += ` recid=${recid}:addr=${recAddr}:verify=${verifyOk}`;
+    if (bytesEqual(pub, compressedPub)) { recovery = BigInt(recid); found = true; }
+  }
+  if (!found) {
+    throw new Error(`recovery failed — expected addr ${keypair.address}.${diag}`);
   }
   const v = chainId * 2n + 35n + recovery;
   const r = BigInt(bytesToHex(sig64.slice(0, 32)));
@@ -842,7 +873,13 @@ async function signAndSendEvmTx(env: Env, fromIndex: number, to: string, value: 
     intToMinimalBytes(r),
     intToMinimalBytes(s),
   ]);
-  return await arbRpc(env, 'eth_sendRawTransaction', [bytesToHex(signed)]);
+  const rawHex = bytesToHex(signed);
+  try {
+    return await arbRpc(env, 'eth_sendRawTransaction', [rawHex]);
+  } catch (err: any) {
+    // 广播失败时把原始交易暴露在错误里,便于本地重播诊断
+    throw new Error(`${err.message} || rawTx=${rawHex}${diag} || unsigned=${bytesToHex(unsigned)} sighash=${bytesToHex(sighash)}`);
+  }
 }
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
@@ -852,7 +889,7 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 }
 
 async function erc20BalanceOf(env: Env, token: string, holder: string): Promise<bigint> {
-  const data = '0x70a08231' + bytesToHex(pad32Bytes(holder.replace(/^0x/, '')));
+  const data = '0x70a08231' + bytesToHex(pad32Bytes(holder.replace(/^0x/, ''))).slice(2);
   const result: string = await arbRpc(env, 'eth_call', [{ to: token, data }, 'latest']);
   return BigInt(result);
 }
@@ -904,8 +941,8 @@ async function sweepEvmOrders(env: Env): Promise<{ attempted: number; swept: num
       // 阶段 2:归集 — 派生地址把全部 USDT/USDC 转到目标钱包
       attempted++;
       const data = '0xa9059cbb'
-        + bytesToHex(pad32Bytes(SWEEP_DEST_EVM.replace(/^0x/, '')))
-        + bytesToHex(pad32Bytes(sweepValue.toString(16)));
+        + bytesToHex(pad32Bytes(SWEEP_DEST_EVM.replace(/^0x/, ''))).slice(2)
+        + bytesToHex(pad32Bytes(sweepValue.toString(16))).slice(2);
       const txHash = await signAndSendEvmTx(env, p.derivation_index ?? SWEEP_SPONSOR_INDEX, token, 0n, data);
       await env.DB.prepare(
         `UPDATE crypto_payments SET swept = 2, swept_tx = ? WHERE order_id = ?`
