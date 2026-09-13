@@ -45,6 +45,8 @@ export interface Env {
   // Cryptomus (方案 B 加密支付) — 通过 `wrangler secret put` 配置
   CRYPTOMUS_MERCHANT_ID?: string;
   CRYPTOMUS_PAYMENT_API_KEY?: string;
+  ADMIN_KEY?: string;
+  ARBITRUM_RPC_URL?: string;  // 免费注册的专属 RPC(Alchemy/Ankr/dRPC 等),配了就优先用
 }
 
 // ============================================================================
@@ -176,6 +178,17 @@ async function requireAdmin(c: any): Promise<boolean> {
 }
 
 // 归集配置与 gas 赞助地址(需给赞助地址充少量 Arbitrum ETH,归集才能执行)
+app.post('/api/admin/sweep-now', async (c) => {
+  if (c.req.header('x-admin-key') !== c.env.ADMIN_KEY) return c.json({ error: 'unauthorized' }, 403);
+  await ensureCryptoSchema(c.env);
+  try {
+    const result = await sweepEvmOrders(c.env);
+    return c.json({ ok: true, ...result });
+  } catch (err: any) {
+    return c.json({ ok: false, error: err.message, stack: err.stack?.slice(0, 500) }, 500);
+  }
+});
+
 app.get('/api/admin/sweep-info', async (c) => {
   if (!(await requireAdmin(c))) return c.json({ error: 'unauthorized' }, 401);
   const sponsor = deriveEvmKeypairFromMnemonic(c.env.XRP_MNEMONIC, SWEEP_SPONSOR_INDEX);
@@ -786,8 +799,8 @@ async function signAndSendEvmTx(env: Env, fromIndex: number, to: string, value: 
   const keypair = deriveEvmKeypairFromMnemonic(env.XRP_MNEMONIC, fromIndex);
   const fromAddr = keypair.address_lowercase;
 
-  const nonce = BigInt(await arbRpc('eth_getTransactionCount', [fromAddr, 'pending']));
-  const gasPrice = BigInt(await arbRpc('eth_gasPrice', [])) * 12n / 10n + 10n**7n; // 抬 20% 避免卡单
+  const nonce = BigInt(await arbRpc(env, 'eth_getTransactionCount', [fromAddr, 'pending']));
+  const gasPrice = BigInt(await arbRpc(env, 'eth_gasPrice', [])) * 12n / 10n + 10n**7n; // 抬 20% 避免卡单
   const gasLimit = 300_000n;
   const chainId = ARB_CHAIN_ID;
 
@@ -829,7 +842,7 @@ async function signAndSendEvmTx(env: Env, fromIndex: number, to: string, value: 
     intToMinimalBytes(r),
     intToMinimalBytes(s),
   ]);
-  return await arbRpc('eth_sendRawTransaction', [bytesToHex(signed)]);
+  return await arbRpc(env, 'eth_sendRawTransaction', [bytesToHex(signed)]);
 }
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
@@ -838,14 +851,16 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
-async function erc20BalanceOf(token: string, holder: string): Promise<bigint> {
+async function erc20BalanceOf(env: Env, token: string, holder: string): Promise<bigint> {
   const data = '0x70a08231' + bytesToHex(pad32Bytes(holder.replace(/^0x/, '')));
-  const result: string = await arbRpc('eth_call', [{ to: token, data }, 'latest']);
+  const result: string = await arbRpc(env, 'eth_call', [{ to: token, data }, 'latest']);
   return BigInt(result);
 }
 
-async function sweepEvmOrders(env: Env): Promise<{ attempted: number; swept: number }> {
+async function sweepEvmOrders(env: Env): Promise<{ attempted: number; swept: number; errors: string[] }> {
+  await ensureCryptoSchema(env);  // cron 不走业务端点,必须自己跑 schema 迁移
   let attempted = 0, swept = 0;
+  const errors: string[] = [];
   const rows = await env.DB.prepare(
     `SELECT order_id, address, derivation_index, pay_currency, amount_usdt, swept
      FROM crypto_payments
@@ -857,7 +872,7 @@ async function sweepEvmOrders(env: Env): Promise<{ attempted: number; swept: num
   for (const p of rows.results || []) {
     try {
       const token = ARB_TOKENS[p.pay_currency];
-      const tokenBalance = await erc20BalanceOf(token, p.address);
+      const tokenBalance = await erc20BalanceOf(env, token, p.address);
       if (tokenBalance === 0n) {
         // 地址空(可能已手动转走)— 标记完成
         await env.DB.prepare(`UPDATE crypto_payments SET swept = 2 WHERE order_id = ?`).bind(p.order_id).run();
@@ -865,14 +880,14 @@ async function sweepEvmOrders(env: Env): Promise<{ attempted: number; swept: num
       }
       if (tokenBalance < SWEEP_MIN) continue; // 低于 1 USDT 暂不归集
 
-      const ethBalance = BigInt(await arbRpc('eth_getBalance', [p.address, 'latest']));
+      const ethBalance = BigInt(await arbRpc(env, 'eth_getBalance', [p.address, 'latest']));
       const sweepValue = tokenBalance; // 全额转出
 
       if (ethBalance < SWEEP_GAS_WEI) {
         // 阶段 1:赞助账户给派生地址补 gas(只在 swept=0 时补一次,避免重复)
         if (p.swept === 0) {
           attempted++;
-          const sponsorBal = BigInt(await arbRpc('eth_getBalance', [
+          const sponsorBal = BigInt(await arbRpc(env, 'eth_getBalance', [
             deriveEvmKeypairFromMnemonic(env.XRP_MNEMONIC, SWEEP_SPONSOR_INDEX).address_lowercase, 'latest',
           ]));
           if (sponsorBal < SWEEP_GAS_WEI + 10n**13n) {
@@ -898,10 +913,11 @@ async function sweepEvmOrders(env: Env): Promise<{ attempted: number; swept: num
       swept++;
       console.log(`[sweep] swept ${sweepValue} of ${p.pay_currency} from ${p.order_id} → ${SWEEP_DEST_EVM} tx=${txHash}`);
     } catch (err: any) {
+      errors.push(`${p.order_id}: ${err.message}`);
       console.error(`[sweep] error for ${p.order_id}: ${err.message}`);
     }
   }
-  return { attempted, swept };
+  return { attempted, swept, errors };
 }
 
 const SELF_TIER_AMOUNTS: Record<string, { usd: number; product: string; expires_sec: number }> = {
@@ -1090,7 +1106,7 @@ app.post('/api/crypto/create-payment', async (c) => {
     } else {
       address = deriveEvmAddressFromMnemonic(c.env.XRP_MNEMONIC, derivationIndex).address_lowercase;
       // 记录建单时区块号,watcher 只扫这之后的 Transfer 日志
-      fromBlock = parseInt(await arbRpc('eth_blockNumber', []), 16);
+      fromBlock = parseInt(await arbRpc(c.env, 'eth_blockNumber', []), 16);
     }
 
     const now = Math.floor(Date.now() / 1000);
@@ -1490,13 +1506,17 @@ async function fetchTronTrc20Txs(address: string, limit = 20): Promise<any[]> {
 const ARBITUM_RPCS = [
   'https://arb1.arbitrum.io/rpc',
   'https://arbitrum-one.publicnode.com',
-  'https://rpc.ankr.com/arbitrum',
+  'https://arbitrum.llamarpc.com',
+  'https://1rpc.io/arb',
+  'https://arbitrum.drpc.org',
+  'https://arb-mainnet.public.blastapi.io',
 ];
 
 // Arbitrum RPC 调用(公共节点限流较严:多端点轮换 + 每端点重试一次)
-async function arbRpc(method: string, params: any[]): Promise<any> {
+async function arbRpc(env: Env, method: string, params: any[]): Promise<any> {
+  const endpoints = env.ARBITRUM_RPC_URL ? [env.ARBITRUM_RPC_URL, ...ARBITUM_RPCS] : ARBITUM_RPCS;
   let lastErr = 'unknown';
-  for (const rpc of ARBITUM_RPCS) {
+  for (const rpc of endpoints) {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const r = await fetch(rpc, {
@@ -1511,7 +1531,7 @@ async function arbRpc(method: string, params: any[]): Promise<any> {
       } catch (e: any) {
         lastErr = e.message;
       }
-      if (attempt === 0) await new Promise(res => setTimeout(res, 600));
+      if (attempt === 0) await new Promise(res => setTimeout(res, 400));
     }
   }
   throw new Error(`Arbitrum RPC ${method} failed on all endpoints: ${lastErr}`);
@@ -1519,15 +1539,15 @@ async function arbRpc(method: string, params: any[]): Promise<any> {
 
 // EVM (Arbitrum One) 入账扫描 — eth_getLogs 查 ERC-20 Transfer 日志(to = 派生地址)
 // 公共 RPC 对单次区块范围有限制,按 5000 块分片(Arbitrum 出块 ~0.25s,30 分钟 ≈ 7200 块)
-async function fetchArbTransfers(token: string, toAddress: string, fromBlock: number): Promise<any[]> {
+async function fetchArbTransfers(env: Env, token: string, toAddress: string, fromBlock: number): Promise<any[]> {
   const paddedTopic = '0x' + '0'.repeat(24) + toAddress.replace(/^0x/, '').toLowerCase();
-  const latest = parseInt(await arbRpc('eth_blockNumber', []), 16);
+  const latest = parseInt(await arbRpc(env, 'eth_blockNumber', []), 16);
 
   const all: any[] = [];
   const CHUNK = 5000;
   for (let start = Math.max(0, fromBlock); start <= latest; start += CHUNK) {
     const end = Math.min(start + CHUNK - 1, latest);
-    const logs = await arbRpc('eth_getLogs', [{ address: token, fromBlock: '0x' + start.toString(16), toBlock: '0x' + end.toString(16), topics: [TRANSFER_TOPIC, null, paddedTopic] }]);
+    const logs = await arbRpc(env, 'eth_getLogs', [{ address: token, fromBlock: '0x' + start.toString(16), toBlock: '0x' + end.toString(16), topics: [TRANSFER_TOPIC, null, paddedTopic] }]);
     all.push(...(logs || []));
     if (end >= latest) break;
   }
@@ -1590,7 +1610,7 @@ async function scanOrderIncoming(env: Env, p: any, now: number): Promise<boolean
 
   if (payCurrency === 'usdt_arb' || payCurrency === 'usdc_arb') {
     const token = ARB_TOKENS[payCurrency];
-    const logs = await fetchArbTransfers(token, p.address, p.from_block ?? 0);
+    const logs = await fetchArbTransfers(env, token, p.address, p.from_block ?? 0);
     let received = 0;
     let txHash: string | null = null;
     const paddedTopic = '0x' + '0'.repeat(24) + p.address.replace(/^0x/, '').toLowerCase();
@@ -1614,6 +1634,7 @@ async function scanOrderIncoming(env: Env, p: any, now: number): Promise<boolean
 }
 
 async function watchCryptoPayments(env: Env): Promise<{ scanned: number; confirmed: number; expired: number }> {
+  await ensureCryptoSchema(env);  // cron 不走业务端点,必须自己跑 schema 迁移
   const now = Math.floor(Date.now() / 1000);
   // 取所有未完成且未过期的订单(含方案 2.5 的三个币种和旧 xrp 单)
   const pending = await env.DB.prepare(

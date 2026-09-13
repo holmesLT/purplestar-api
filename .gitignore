@@ -9,3 +9,4 @@ dist/
 build/
 .wrangler-test/
 test-*.ts
+.admin-key-local.txt
