@@ -725,7 +725,7 @@ app.post('/indexnow', async (c) => {
 //   状态机:waiting → confirming (链上确认中) → confirmed → finished
 //                              ↘ failed / expired (>30 min)
 //   锁定价格:创单时 USD→XRP 汇率,30 分钟内按此金额收(防止汇率波动)
-//   链上 watcher:CF Cron Triggers (每 60s 一次,扫 XRP ledger)
+//   链上 watcher:CF Cron Triggers (每 15 分钟一次,扫待付订单)
 // ====================================================================
 
 import { deriveXrpAddressFromMnemonic } from './lib/xrp-hd';
@@ -1227,7 +1227,7 @@ app.get('/api/crypto/payment/:orderId', async (c) => {
     }
   }
 
-  // 方案 2.5 — 派生地址订单:状态查询时顺带做一次链上扫描(cron 是 2 分钟兜底,这里秒级响应)
+  // 方案 2.5 — 派生地址订单:状态查询时顺带做一次链上扫描(cron 是 15 分钟兜底,这里秒级响应)
   if (
     row.processor === 'self_hd' && row.status === 'waiting' && !expired &&
     (SUPPORTED_PAY_CURRENCIES as readonly string[]).includes(row.pay_currency)
@@ -1488,7 +1488,7 @@ app.get('/api/nowpayments/payment/:id', async (c) => {
 
 // ====================================================================
 // CF Cron Trigger — 链上 watcher
-//   每 60 秒扫一次所有 status IN (waiting, confirming) 的订单
+//   每 15 分钟扫一次所有 status IN (waiting, confirming) 的订单
 //   用 xrpl.org public rippled JSON-RPC 查每个地址的入账
 //   命中:更新 status=finished/confirmed,记录 tx_hash
 // ====================================================================
@@ -1707,7 +1707,7 @@ async function watchCryptoPayments(env: Env): Promise<{ scanned: number; confirm
   };
 }
 
-// CF scheduled handler — wrangler.toml 里 [triggers] crons = ["*\/2 * * * *"] 每 2 分钟
+// CF scheduled handler — wrangler.toml 里 [triggers] crons = ["*/15 * * * *"] 每 15 分钟
 async function handleScheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
   ctx.waitUntil(
     watchCryptoPayments(env).then(r =>

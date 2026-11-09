@@ -56,6 +56,21 @@ export interface DerivedAddress {
   pubkey: string; // hex (compressed, 33 bytes)
 }
 
+// Seed 缓存 — 性能关键:见 evm-hd.ts。`mnemonicToSeedSync` 是
+// PBKDF2-HMAC-SHA512 × 2048 次迭代,纯 JS 实现,实测单次约 13ms CPU,
+// 已超过 Workers 免费版每次调用 10ms 的上限;同一个 isolate 里算一次复用。
+const seedCache = new Map<string, Uint8Array>();
+
+function getSeed(mnemonic: string, passphrase: string = ''): Uint8Array {
+  const key = mnemonic + '\0' + passphrase;
+  let seed = seedCache.get(key);
+  if (!seed) {
+    seed = bip39.mnemonicToSeedSync(mnemonic, passphrase);
+    seedCache.set(key, seed);
+  }
+  return seed;
+}
+
 /**
  * Derive XRP classic address from BIP39 mnemonic at a given index.
  *
@@ -71,7 +86,7 @@ export function deriveXrpAddressFromMnemonic(
   if (!bip39.validateMnemonic(mnemonic, wordlist)) {
     throw new Error('Invalid BIP39 mnemonic');
   }
-  const seed = bip39.mnemonicToSeedSync(mnemonic, passphrase);
+  const seed = getSeed(mnemonic, passphrase);
   const master = HDKey.fromMasterSeed(seed);
   const child = master.derive(`m/44'/144'/0'/0/${index}`);
   if (!child.publicKey) throw new Error('Failed to derive public key');

@@ -30,6 +30,34 @@ export interface DerivedEvmKeypair extends DerivedEvmAddress {
   private_key_hex: string;  // 0x... 32-byte private key (SENSITIVE — admin export only)
 }
 
+// Seed 缓存 — 性能关键:
+// `mnemonicToSeedSync` 是 PBKDF2-HMAC-SHA512 × 2048 次迭代,纯 JS 实现,
+// 实测单次约 13ms CPU,已超过 Workers 免费版每次调用 10ms 的上限。
+// 同一个 isolate 里助记词不会变,算一次缓存起来复用;缓存的是种子,
+// 与直接持有助记词的 isolate 内存安全性相同,不新增暴露面。
+const seedCache = new Map<string, Uint8Array>();
+
+function getSeed(mnemonic: string, passphrase: string = ''): Uint8Array {
+  const key = mnemonic + '\0' + passphrase;
+  let seed = seedCache.get(key);
+  if (!seed) {
+    seed = bip39.mnemonicToSeedSync(mnemonic, passphrase);
+    seedCache.set(key, seed);
+  }
+  return seed;
+}
+
+// 从压缩公钥(33 字节)算 EVM 地址(小写 0x... 形式)
+function evmAddressFromPublicKey(publicKey: Uint8Array): string {
+  // Uncompress 33-byte pubkey (0x02|0x03) to 64 bytes X||Y
+  const point = secp256k1.Point.fromBytes(publicKey);
+  const uncompressed = point.toBytes(false);
+  const xy = uncompressed.slice(1, 65);
+  const hash = keccak_256(xy);
+  const addrBytes = hash.slice(-20);
+  return '0x' + Array.from(addrBytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 function toChecksumAddress(addrHexLower: string): string {
   // EIP-55: keccak-256 of the lowercase hex string (ASCII, no 0x) drives the case of each hex char
   const addr = addrHexLower.replace(/^0x/, '');
@@ -51,19 +79,12 @@ export function deriveEvmAddressFromMnemonic(
   if (!bip39.validateMnemonic(mnemonic, wordlist)) {
     throw new Error('Invalid BIP39 mnemonic');
   }
-  const seed = bip39.mnemonicToSeedSync(mnemonic, passphrase);
+  const seed = getSeed(mnemonic, passphrase);
   const master = HDKey.fromMasterSeed(seed);
   const child = master.derive(`m/44'/60'/0'/0/${index}`);
   if (!child.publicKey) throw new Error('Failed to derive public key');
 
-  // Uncompress 33-byte pubkey (0x02|0x03) to 64 bytes X||Y
-  const point = secp256k1.Point.fromBytes(child.publicKey);
-  const uncompressed = point.toBytes(false);
-  const xy = uncompressed.slice(1, 65);
-
-  const hash = keccak_256(xy);
-  const addrBytes = hash.slice(-20);
-  const addrLower = '0x' + Array.from(addrBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  const addrLower = evmAddressFromPublicKey(child.publicKey);
 
   return {
     index,
@@ -80,13 +101,18 @@ export function deriveEvmKeypairFromMnemonic(
   if (!bip39.validateMnemonic(mnemonic, wordlist)) {
     throw new Error('Invalid BIP39 mnemonic');
   }
-  const seed = bip39.mnemonicToSeedSync(mnemonic, passphrase);
+  // 注意:不要再调 deriveEvmAddressFromMnemonic——它会重新验助记词、
+  // 重新派生种子和子密钥。直接用已派生的 child 一次算完。
+  const seed = getSeed(mnemonic, passphrase);
   const master = HDKey.fromMasterSeed(seed);
   const child = master.derive(`m/44'/60'/0'/0/${index}`);
   if (!child.privateKey) throw new Error('Failed to derive private key');
-  const base = deriveEvmAddressFromMnemonic(mnemonic, index, passphrase);
+  if (!child.publicKey) throw new Error('Failed to derive public key');
+  const addrLower = evmAddressFromPublicKey(child.publicKey);
   return {
-    ...base,
+    index,
+    address: toChecksumAddress(addrLower),
+    address_lowercase: addrLower,
     private_key_hex: '0x' + Array.from(child.privateKey).map(b => b.toString(16).padStart(2, '0')).join(''),
   };
 }

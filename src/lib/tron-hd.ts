@@ -1,11 +1,15 @@
 /**
  * Tron HD wallet address derivation (BIP44 SLIP-0044 coin type 195).
  *
- * Verified against BIP44 standard test vector (well-known reference):
+ * Verified against BIP44 standard test vector (cross-checked with
+ * Python bip-utils, 2026-11-09):
  *   Mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
  *   Path:     m / 44' / 195' / 0' / 0 / 0
- *   Expected: TKDu5yQ5oy2WAinZsxC2cD3CmHyYM7Rr4D
+ *   Expected: TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH
  *            (Keccak-256(uncompressed pubkey)[12..32] → base58check(0x41 || ... ))
+ *   NOTE: an earlier version of this comment listed TKDu5yQ5oy2WAinZsxC2cD3CmHyYM7Rr4D
+ *   for this vector — that value is incorrect for this path; the code itself
+ *   was already deriving TUEZS..., and bip-utils agrees.
  *
  * Path semantics:
  *   44'   = BIP44
@@ -39,6 +43,21 @@ export interface DerivedTronAddress {
   pubkey_uncompressed: string; // 0x04 || X || Y (65 bytes hex)
 }
 
+// Seed 缓存 — 性能关键:见 evm-hd.ts。`mnemonicToSeedSync` 是
+// PBKDF2-HMAC-SHA512 × 2048 次迭代,纯 JS 实现,实测单次约 13ms CPU,
+// 已超过 Workers 免费版每次调用 10ms 的上限;同一个 isolate 里算一次复用。
+const seedCache = new Map<string, Uint8Array>();
+
+function getSeed(mnemonic: string, passphrase: string = ''): Uint8Array {
+  const key = mnemonic + '\0' + passphrase;
+  let seed = seedCache.get(key);
+  if (!seed) {
+    seed = bip39.mnemonicToSeedSync(mnemonic, passphrase);
+    seedCache.set(key, seed);
+  }
+  return seed;
+}
+
 function uncompressPublicKey(compressed: Uint8Array): Uint8Array {
   if (compressed.length === 65 && compressed[0] === 0x04) {
     // strip 0x04 prefix
@@ -67,7 +86,7 @@ export function deriveTronAddressFromMnemonic(
   if (!bip39.validateMnemonic(mnemonic, wordlist)) {
     throw new Error('Invalid BIP39 mnemonic');
   }
-  const seed = bip39.mnemonicToSeedSync(mnemonic, passphrase);
+  const seed = getSeed(mnemonic, passphrase);
   const master = HDKey.fromMasterSeed(seed);
   const child = master.derive(`m/44'/195'/0'/0/${index}`);
   if (!child.privateKey) throw new Error('Failed to derive private key');
@@ -113,7 +132,7 @@ export function deriveTronPrivateKeyFromMnemonic(
   if (!bip39.validateMnemonic(mnemonic, wordlist)) {
     throw new Error('Invalid BIP39 mnemonic');
   }
-  const seed = bip39.mnemonicToSeedSync(mnemonic, passphrase);
+  const seed = getSeed(mnemonic, passphrase);
   const master = HDKey.fromMasterSeed(seed);
   const child = master.derive(`m/44'/195'/0'/0/${index}`);
   if (!child.privateKey) throw new Error('Failed to derive private key');
